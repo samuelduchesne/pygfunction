@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from functools import lru_cache
+
 import numpy as np
 from scipy.integrate import quad, quad_vec
 from scipy.special import erfc, erf, roots_legendre
@@ -217,23 +219,10 @@ def finite_line_source(
                     time, alpha, dis, H1, D1, H2, D2,
                     reaSource=reaSource, imgSource=imgSource, N=N)
             else:
-                # Integrand of the finite line source solution
-                f = _finite_line_source_integrand(
-                    dis, H1, D1, H2, D2, reaSource, imgSource)
                 # Evaluate integral
-                if isinstance(time, (np.floating, float)):
-                    # Lower bound of integration
-                    a = 1.0 / np.sqrt(4.0*alpha*time)
-                    h = 0.5 / H2 * quad(f, a, np.inf)[0]
-                else:
-                    # Lower bound of integration
-                    a = 1.0 / np.sqrt(4.0*alpha*time)
-                    # Upper bound of integration
-                    b = np.concatenate(([np.inf], a[:-1]))
-                    h = np.cumsum(np.stack(
-                        [0.5 / H2 * quad(f, a_i, b_i)[0]
-                         for t, a_i, b_i in zip(time, a, b)],
-                        axis=-1), axis=-1)
+                h = finite_line_source_vectorized(
+                    time, alpha, dis, H1, D1, H2, D2,
+                    reaSource=reaSource, imgSource=imgSource)
         else:
             # At least one borehole is tilted
             # Unpack parameters
@@ -257,26 +246,12 @@ def finite_line_source(
                     x2, y2, H2, D2, tilt2, orientation2,
                     reaSource=reaSource, imgSource=imgSource, M=M, N=N)
             else:
-                # Integrand of the inclined finite line source solution
-                f = _finite_line_source_inclined_integrand(
+                # Evaluate integral
+                h = finite_line_source_inclined_vectorized(
+                    time, alpha,
                     rb1, x1, y1, H1, D1, tilt1, orientation1,
                     x2, y2, H2, D2, tilt2, orientation2,
-                    reaSource, imgSource, M)
-
-                # Evaluate integral
-                if isinstance(time, (np.floating, float)):
-                    # Lower bound of integration
-                    a = 1.0 / np.sqrt(4.0*alpha*time)
-                    h = 0.5 / H2 * quad(f, a, np.inf)[0]
-                else:
-                    # Lower bound of integration
-                    a = 1.0 / np.sqrt(4.0*alpha*time)
-                    # Upper bound of integration
-                    b = np.concatenate(([np.inf], a[:-1]))
-                    h = np.cumsum(np.stack(
-                        [0.5 / H2 * quad(f, a_i, b_i)[0]
-                         for t, a_i, b_i in zip(time, a, b)],
-                        axis=-1), axis=-1)
+                    reaSource=reaSource, imgSource=imgSource, M=M)
 
     else:
         # Unpack parameters
@@ -754,23 +729,16 @@ def finite_line_source_vectorized(
     """
     if not approximation:
         # Integrand of the finite line source solution
-        f = _finite_line_source_integrand(
+        f = _finite_line_source_node_integrand(
             dis, H1, D1, H2, D2, reaSource, imgSource)
-
-        # Evaluate integral
+        # Evaluate integral for all time values
+        d_min = float(np.min(dis)) if np.size(dis) > 0 else 1.
+        h = _finite_line_source_integral_all_times(
+            f, time, alpha, d_min)
         if isinstance(time, (np.floating, float)):
-            # Lower bound of integration
-            a = 1.0 / np.sqrt(4.0*alpha*time)
-            h = 0.5 / H2 * quad_vec(f, a, np.inf)[0]
+            h = 0.5 / H2 * h
         else:
-            # Lower bound of integration
-            a = 1.0 / np.sqrt(4.0*alpha*time)
-            # Upper bound of integration
-            b = np.concatenate(([np.inf], a[:-1]))
-            h = np.cumsum(np.stack(
-                [0.5 / H2 * quad_vec(f, a_i, b_i)[0]
-                 for t, a_i, b_i in zip(time, a, b)],
-                axis=-1), axis=-1)
+            h = 0.5 / np.expand_dims(np.asarray(H2, dtype=float), axis=-1) * h
     else:
         h = finite_line_source_approximation(
             time, alpha, dis, H1, D1, H2, D2, reaSource=reaSource,
@@ -868,23 +836,17 @@ def finite_line_source_equivalent_boreholes_vectorized(
 
     """
     # Integrand of the finite line source solution
-    f = _finite_line_source_equivalent_boreholes_integrand(
+    f = _finite_line_source_equivalent_boreholes_node_integrand(
         dis, wDis, H1, D1, H2, D2, N2, reaSource, imgSource)
-
-    # Evaluate integral
+    # Evaluate integral for all time values
+    d_min = float(np.min(dis)) if np.size(dis) > 0 else 1.
+    h = _finite_line_source_integral_all_times(
+        f, time, alpha, d_min)
     if isinstance(time, (np.floating, float)):
-        # Lower bound of integration
-        a = 1.0 / np.sqrt(4.0*alpha*time)
-        h = 0.5 / (N2*H2) * quad_vec(f, a, np.inf)[0]
+        h = 0.5 / (N2*H2) * h
     else:
-        # Lower bound of integration
-        a = 1.0 / np.sqrt(4.0*alpha*time)
-        # Upper bound of integration
-        b = np.concatenate(([np.inf], a[:-1]))
-        h = np.cumsum(np.stack(
-            [0.5 / (N2*H2) * quad_vec(f, a_i, b_i)[0]
-             for t, a_i, b_i in zip(time, a, b)],
-            axis=-1), axis=-1)
+        h = 0.5 / np.expand_dims(
+            np.asarray(N2*H2, dtype=float), axis=-1) * h
     return h
 
 
@@ -1045,34 +1007,430 @@ def finite_line_source_inclined_vectorized(
     """
     if not approximation:
         # Integrand of the inclined finite line source solution
-        f = _finite_line_source_inclined_integrand(
+        f, d_min = _finite_line_source_inclined_node_integrand(
             rb1, x1, y1, H1, D1, tilt1, orientation1,
             x2, y2, H2, D2, tilt2, orientation2,
             reaSource, imgSource, M)
-
-        # Evaluate integral
+        # Evaluate integral for all time values
+        h = _finite_line_source_integral_all_times(
+            f, time, alpha, d_min)
         if isinstance(time, (np.floating, float)):
-            # Lower bound of integration
-            a = 1.0 / np.sqrt(4.0*alpha*time)
-            h = 0.5 / H2 * quad_vec(f, a, np.inf, epsabs=1e-4, epsrel=1e-6)[0]
+            h = 0.5 / H2 * h
         else:
-            # Lower bound of integration
-            a = 1.0 / np.sqrt(4.0*alpha*time)
-            # Upper bound of integration
-            b = np.concatenate(([np.inf], a[:-1]))
-            h = np.cumsum(
-                np.stack(
-                    [0.5 / H2 * quad_vec(
-                        f, a_i, b_i, epsabs=1e-4, epsrel=1e-6)[0]
-                     for i, (a_i, b_i) in enumerate(zip(a, b))],
-                    axis=-1),
-                axis=-1)
+            h = 0.5 / np.expand_dims(np.asarray(H2, dtype=float), axis=-1) * h
     else:
         h = finite_line_source_inclined_approximation(
             time, alpha, rb1, x1, y1, H1, D1, tilt1, orientation1,
             x2, y2, H2, D2, tilt2, orientation2,
             reaSource=reaSource, imgSource=imgSource, M=M, N=N)
     return h
+
+
+@lru_cache(maxsize=None)
+def _roots_legendre_cached(deg):
+    """Cached nodes and weights of Gauss-Legendre quadrature."""
+    x, w = roots_legendre(deg)
+    return x, w
+
+
+def _finite_line_source_coefficients(H1, D1, H2, D2, reaSource, imgSource):
+    """
+    Coefficients (p, q) of the terms of the integrand of the finite line
+    source solution, such that the integrand is given by:
+
+        f(s) = s**-2 * exp(-dis**2 * s**2) * sum_j (p_j * erfint(q_j * s))
+
+    Parameters
+    ----------
+    H1 : float or array
+        Lengths of the emitting heat sources.
+    D1 : float or array
+        Buried depths of the emitting heat sources.
+    H2 : float or array
+        Lengths of the receiving heat sources.
+    D2 : float or array
+        Buried depths of the receiving heat sources.
+    reaSource : bool
+        True if the real part of the FLS solution is to be included.
+    imgSource : bool
+        True if the image part of the FLS solution is to be included.
+
+    Returns
+    -------
+    p : array
+        Signs of the terms of the integrand, shape (nq,).
+    q : array
+        Coefficients of the terms of the integrand. The last axis is of
+        length nq.
+
+    """
+    if reaSource and imgSource:
+        # Full (real + image) FLS solution
+        p = np.array([1, -1, 1, -1, 1, -1, 1, -1])
+        q = np.stack([D2 - D1 + H2,
+                      D2 - D1,
+                      D2 - D1 - H1,
+                      D2 - D1 + H2 - H1,
+                      D2 + D1 + H2,
+                      D2 + D1,
+                      D2 + D1 + H1,
+                      D2 + D1 + H2 + H1],
+                     axis=-1)
+    elif reaSource:
+        # Real FLS solution
+        p = np.array([1, -1, 1, -1])
+        q = np.stack([D2 - D1 + H2,
+                      D2 - D1,
+                      D2 - D1 - H1,
+                      D2 - D1 + H2 - H1],
+                     axis=-1)
+    elif imgSource:
+        # Image FLS solution
+        p = np.array([1, -1, 1, -1])
+        q = np.stack([D2 + D1 + H2,
+                      D2 + D1,
+                      D2 + D1 + H1,
+                      D2 + D1 + H2 + H1],
+                     axis=-1)
+    else:
+        # No heat source
+        p = np.zeros(1)
+        q = np.zeros(
+            np.broadcast_shapes(
+                *[np.shape(arg) for arg in (H1, D1, H2, D2)]) + (1,))
+    return p, q
+
+
+def _finite_line_source_integral_all_times(
+        f, time, alpha, d_min, deg=10, log_ratio=0.5):
+    """
+    Evaluate the integral of the finite line source solution at all times.
+
+    The cumulative integrals:
+
+        I_k = int_{a_k}^{inf} f(s) ds,    a_k = 1 / sqrt(4 * alpha * t_k)
+
+    are evaluated for all time values simultaneously using composite
+    Gauss-Legendre quadrature over log-spaced panels between consecutive
+    integration bounds. The integral is truncated at
+    s_max = 9 / d_min, where the integrand is negligible (the integrand
+    decays at least as fast as exp(-d_min**2 * s**2) / s, so that the
+    neglected part of the integral is below 1e-36 relative to the scale of
+    the integrand coefficients).
+
+    Parameters
+    ----------
+    f : callable
+        Integrand of the finite line source solution. Accepts an array of
+        integration points s of shape (ns,) and returns an array of shape
+        (..., ns).
+    time : float or array, shape (nt,)
+        Value of time (in seconds) for which the integral is evaluated.
+    alpha : float
+        Soil thermal diffusivity (in m2/s).
+    d_min : float
+        Minimum radial distance (in meters) in the integrand. This provides
+        the decay scale used to truncate the integral.
+    deg : int, optional
+        Degree of the Gauss-Legendre quadrature over each panel.
+        Default is 10.
+    log_ratio : float, optional
+        Maximum width of a panel in logarithmic space,
+        i.e. log(s_upper) - log(s_lower) <= log_ratio.
+        Default is 0.5.
+
+    Returns
+    -------
+    I : array
+        Values of the integral, shape (..., nt), or (...,) if time is a
+        float.
+
+    """
+    scalar_time = isinstance(time, (np.floating, float, int))
+    t = np.atleast_1d(np.asarray(time, dtype=float))
+    nt = t.size
+    # Shape of the integrand
+    out_shape = np.shape(f(np.ones(1)))[:-1]
+    out_size = int(np.prod(out_shape, dtype=int))
+    if out_size == 0:
+        # Empty integrand
+        if scalar_time:
+            return np.zeros(out_shape)
+        return np.zeros(out_shape + (nt,))
+    # Integration bounds in ascending order (i.e. descending time)
+    i_sort = np.argsort(t)
+    bounds = 1.0 / np.sqrt(4.0 * alpha * t[i_sort][::-1])
+    # Truncation of the integral at s_max, where the integrand is negligible
+    s_max = max(9.0 / d_min, bounds[-1])
+    # Pieces of the integral between consecutive integration bounds
+    lo = np.minimum(bounds, s_max)
+    hi = np.append(lo[1:], s_max)
+    # Number of log-spaced panels per piece
+    log_width = np.log(hi) - np.log(lo)
+    nPanels = np.ceil(log_width / log_ratio - 1e-12).astype(int)
+    # Log-spaced panel edges within each piece
+    panel_lo = np.concatenate(
+        [lo_i * np.exp(np.arange(n_i) * (w_i / n_i)) if n_i > 0
+         else np.empty(0)
+         for lo_i, w_i, n_i in zip(lo, log_width, nPanels)])
+    panel_hi = np.concatenate(
+        [np.append(lo_i * np.exp(np.arange(1, n_i) * (w_i / n_i)), hi_i)
+         if n_i > 0 else np.empty(0)
+         for lo_i, hi_i, w_i, n_i in zip(lo, hi, log_width, nPanels)])
+    nPanelsTotal = len(panel_lo)
+    # Gauss-Legendre nodes and weights on each panel
+    x, w = _roots_legendre_cached(deg)
+    panel_mid = 0.5 * (panel_lo + panel_hi)
+    panel_half = 0.5 * (panel_hi - panel_lo)
+    s_nodes = (panel_mid[:, np.newaxis]
+               + panel_half[:, np.newaxis] * x).flatten()
+    w_nodes = (panel_half[:, np.newaxis] * w).flatten()
+    # Integrals over each panel, evaluated in chunks to limit memory use
+    panel_integrals = np.empty(out_shape + (nPanelsTotal,))
+    chunk_size = max(2**23 // max(deg * out_size, 1), 1)
+    for i0 in range(0, nPanelsTotal, chunk_size):
+        i1 = min(i0 + chunk_size, nPanelsTotal)
+        values = f(s_nodes[i0*deg:i1*deg]) * w_nodes[i0*deg:i1*deg]
+        panel_integrals[..., i0:i1] = values.reshape(
+            out_shape + (i1 - i0, deg)).sum(axis=-1)
+    # Integrals over each piece
+    panel_cumsum = np.concatenate(
+        (np.zeros(out_shape + (1,)),
+         np.cumsum(panel_integrals, axis=-1)),
+        axis=-1)
+    piece_ends = np.cumsum(nPanels)
+    piece_starts = piece_ends - nPanels
+    piece_integrals = (
+        panel_cumsum[..., piece_ends] - panel_cumsum[..., piece_starts])
+    # Cumulative integrals I_k (in descending order of integration bounds,
+    # i.e. ascending order of time)
+    I = np.cumsum(piece_integrals[..., ::-1], axis=-1)
+    # Return the integrals in the original order of the time values
+    integrals = np.empty(out_shape + (nt,))
+    integrals[..., i_sort] = I
+    if scalar_time:
+        integrals = integrals[..., 0]
+    return integrals
+
+
+def _finite_line_source_node_integrand(dis, H1, D1, H2, D2, reaSource, imgSource):
+    """
+    Integrand of the finite line source solution, evaluated at an array of
+    integration points.
+
+    Parameters
+    ----------
+    dis : float or array
+        Radial distances to evaluate the FLS solution.
+    H1 : float or array
+        Lengths of the emitting heat sources.
+    D1 : float or array
+        Buried depths of the emitting heat sources.
+    H2 : float or array
+        Lengths of the receiving heat sources.
+    D2 : float or array
+        Buried depths of the receiving heat sources.
+    reaSource : bool
+        True if the real part of the FLS solution is to be included.
+    imgSource : bool
+        True if the image part of the FLS solution is to be included.
+
+    Returns
+    -------
+    f : callable
+        Integrand of the finite line source solution. Accepts an array of
+        integration points s of shape (ns,) and returns an array of shape
+        (..., ns), where (...) is the broadcast shape of the input
+        parameters.
+
+    """
+    p, q = _finite_line_source_coefficients(
+        H1, D1, H2, D2, reaSource, imgSource)
+    dd = np.square(dis)
+
+    def f(s):
+        G = np.einsum(
+            'i,...ik->...k', p, erfint(np.multiply.outer(q, s)))
+        E = np.exp(-np.multiply.outer(dd, np.square(s)))
+        return E * G / np.square(s)
+
+    return f
+
+
+def _finite_line_source_equivalent_boreholes_node_integrand(
+        dis, wDis, H1, D1, H2, D2, N2, reaSource, imgSource):
+    """
+    Integrand of the equivalent finite line source solution, evaluated at an
+    array of integration points.
+
+    Parameters
+    ----------
+    dis : array
+        Unique radial distances to evaluate the FLS solution.
+    wDis : array
+        Number of instances of each unique radial distances.
+    H1 : float or array
+        Lengths of the emitting heat sources.
+    D1 : float or array
+        Buried depths of the emitting heat sources.
+    H2 : float or array
+        Lengths of the receiving heat sources.
+    D2 : float or array
+        Buried depths of the receiving heat sources.
+    N2 : float or array,
+        Number of segments represented by the receiving heat sources.
+    reaSource : bool
+        True if the real part of the FLS solution is to be included.
+    imgSource : bool
+        True if the image part of the FLS solution is to be included.
+
+    Returns
+    -------
+    f : callable
+        Integrand of the finite line source solution. Accepts an array of
+        integration points s of shape (ns,) and returns an array of shape
+        (..., ns).
+
+    """
+    p, q = _finite_line_source_coefficients(
+        H1, D1, H2, D2, reaSource, imgSource)
+    dd = np.square(np.asarray(dis, dtype=float).flatten())
+    wDisT = np.asarray(wDis, dtype=float).T
+
+    def f(s):
+        G = np.einsum(
+            'i,...ik->...k', p, erfint(np.multiply.outer(q, s)))
+        E = wDisT @ np.exp(-np.multiply.outer(dd, np.square(s)))
+        return np.expand_dims(E, axis=-2) * G / np.square(s)
+
+    return f
+
+
+def _finite_line_source_inclined_node_integrand(
+        rb1, x1, y1, H1, D1, tilt1, orientation1,
+        x2, y2, H2, D2, tilt2, orientation2, reaSource, imgSource, M):
+    """
+    Integrand of the inclined finite line source solution, evaluated at an
+    array of integration points.
+
+    Parameters
+    ----------
+    rb1 : array
+        Radii of the emitting heat sources.
+    x1, y1 : float or array
+        Positions of the emitting heat sources.
+    H1 : float or array
+        Lengths of the emitting heat sources.
+    D1 : float or array
+        Buried depths of the emitting heat sources.
+    tilt1 : float or array
+        Angles (in radians) from vertical of the emitting heat sources.
+    orientation1 : float or array
+        Directions (in radians) of the tilt the emitting heat sources.
+    x2, y2 : float or array
+        Positions of the receiving heat sources.
+    H2 : float or array
+        Lengths of the receiving heat sources.
+    D2 : float or array
+        Buried depths of the receiving heat sources.
+    tilt2 : float or array
+        Angles (in radians) from vertical of the receiving heat sources.
+    orientation2 : float or array
+        Directions (in radians) of the tilt the receiving heat sources.
+    reaSource : bool
+        True if the real part of the FLS solution is to be included.
+    imgSource : bool
+        True if the image part of the FLS solution is to be included.
+    M : int
+        Number of points for the Gauss-Legendre quadrature rule along the
+        receiving heat sources.
+
+    Returns
+    -------
+    f : callable
+        Integrand of the inclined finite line source solution. Accepts an
+        array of integration points s of shape (ns,) and returns an array
+        of shape (..., ns), where (...) is the broadcast shape of the input
+        parameters.
+    d_min : float
+        Decay scale (in meters) of the integrand, such that the integrand
+        decays at least as fast as exp(-d_min**2 * s**2).
+
+    """
+    output_shape = np.broadcast_shapes(
+            *[np.shape(arg) for arg in (
+                rb1, x1, y1, H1, D1, tilt1, orientation1,
+                x2, y2, H2, D2, tilt2, orientation2)])
+    output_ndim = len(output_shape)
+    # Expand parameters with a trailing axis for the integration points s
+    expand = lambda arr: np.reshape(
+        np.broadcast_to(arr, output_shape), output_shape + (1,))
+    # Roots for Gauss-Legendre quadrature, with an additional trailing axis
+    # for the integration points s
+    x, w = _roots_legendre_cached(M)
+    u = (0.5 * x + 0.5).reshape((-1,) + (1,) * (output_ndim + 1))
+    w = w / 2
+    # Sines and cosines of tilt (b: beta) and orientation (t: theta)
+    sb1 = np.sin(tilt1)
+    sb2 = np.sin(tilt2)
+    cb1 = np.cos(tilt1)
+    cb2 = np.cos(tilt2)
+    dx = x1 - x2
+    dy = y1 - y2
+    rr = np.maximum(dx**2 + dy**2, rb1**2)
+    H1e = expand(H1)
+    H2e = expand(H2)
+    # Terms of the integrand for the real and image sources. Each term is a
+    # tuple (sign, c, k), where the term of the integrand is given by:
+    #    sign * exp(-c * s**2) * (erf(k * s) - erf((k - H2) * s))
+    # with c and k evaluated at the M quadrature points u along the emitting
+    # heat source.
+    terms = []
+    if reaSource:
+        dzRea = D1 - D2
+        kRea_0 = sb1 * sb2 * np.cos(orientation1 - orientation2) + cb1 * cb2
+        kRea_1 = sb1 * (np.cos(orientation1) * dx + np.sin(orientation1) * dy) + cb1 * dzRea
+        kRea_2 = sb2 * (np.cos(orientation2) * dx + np.sin(orientation2) * dy) + cb2 * dzRea
+        cRea = (expand(rr + dzRea**2)
+                - (u**2 * H1e**2 * (expand(kRea_0)**2 - 1)
+                   + 2 * u * H1e * expand(kRea_0 * kRea_2 - kRea_1)
+                   + expand(kRea_2)**2))
+        kRea = u * H1e * expand(kRea_0) + expand(kRea_2)
+        terms.append((1., cRea, kRea))
+    if imgSource:
+        dzImg = D1 + D2
+        kImg_0 = sb1 * sb2 * np.cos(orientation1 - orientation2) - cb1 * cb2
+        kImg_1 = sb1 * (np.cos(orientation1) * dx + np.sin(orientation1) * dy) + cb1 * dzImg
+        kImg_2 = sb2 * (np.cos(orientation2) * dx + np.sin(orientation2) * dy) - cb2 * dzImg
+        # The radial distance is clamped at the borehole radius when the
+        # real part of the FLS solution is included
+        rrImg = rr if reaSource else dx**2 + dy**2
+        cImg = (expand(rrImg + dzImg**2)
+                - (u**2 * H1e**2 * (expand(kImg_0)**2 - 1)
+                   + 2 * u * H1e * expand(kImg_0 * kImg_2 - kImg_1)
+                   + expand(kImg_2)**2))
+        kImg = u * H1e * expand(kImg_0) + expand(kImg_2)
+        terms.append((-1., cImg, kImg))
+    if len(terms) == 0:
+        d_min = 1.
+        f = lambda s: np.zeros(output_shape + np.shape(s))
+        return f, d_min
+    # Decay scale of the integrand, clamped to a fraction of the borehole
+    # radius to protect against (nearly) intersecting boreholes
+    if int(np.prod(output_shape, dtype=int)) > 0:
+        c_min = np.min([np.min(c) for (_, c, _) in terms])
+        d_min = np.sqrt(max(c_min, np.min(np.square(rb1)) * 1e-4))
+    else:
+        d_min = 1.
+
+    def f(s):
+        total = np.zeros((M,) + output_shape + np.shape(s))
+        for (sign, c, k) in terms:
+            total += sign * np.exp(-c * np.square(s)) \
+                * (erf(k * s) - erf((k - H2e) * s))
+        return np.einsum('i,i...->...', w, total) * (H1e / s)
+
+    return f, d_min
 
 
 def _finite_line_source_integrand(dis, H1, D1, H2, D2, reaSource, imgSource):
