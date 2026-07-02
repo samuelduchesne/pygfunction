@@ -604,3 +604,54 @@ def test_gfunctions_from_static_params(field, boundary_condition, method, opts, 
     # evaluate g-function
     gFunc = gfunc.evaluate_g_function(time=time)
     assert np.allclose(gFunc, expected)
+
+
+# =============================================================================
+# Test the factored ('matrix-free') solver of the 'similarities' method
+# =============================================================================
+# Test that the factored solver returns the same g-function as the dense
+# solver for a bore field of identical vertical boreholes
+def test_gfunctions_factored_UBWT():
+    # Rectangular bore field of identical vertical boreholes
+    field = gt.boreholes.rectangle_field(4, 3, 7.5, 7.5, 150., 4., 0.075)
+    alpha = 1e-6            # Ground thermal diffusivity [m2/s]
+    # Bore field characteristic time [s]
+    ts = 150.**2 / (9 * alpha)
+    # Times for the g-function [s]
+    time = np.array([0.01, 0.1, 1., 10.]) * ts
+    # Factored (matrix-free) solver
+    solver = gt.solvers.Similarities(
+        field, None, time, 'UBWT', nSegments=8, profiles=True)
+    assert solver._identical_vertical_field
+    gFunc_factored = solver._solve_factored_UBWT(time, alpha)
+    # Dense solver
+    solver_dense = gt.solvers.Similarities(
+        field, None, time, 'UBWT', nSegments=8, profiles=True)
+    solver_dense._identical_vertical_field = False
+    gFunc_dense = solver_dense.solve(time, alpha)
+    assert np.allclose(gFunc_factored, gFunc_dense, rtol=1e-8, atol=1e-8)
+    assert np.allclose(solver.Q_b, solver_dense.Q_b, rtol=1e-6, atol=1e-8)
+
+
+# Test that the public solve() method dispatches to the factored solver for
+# a large bore field of identical vertical boreholes and returns the same
+# g-function as the dense solver
+def test_gfunctions_factored_UBWT_dispatch():
+    # Rectangular bore field of identical vertical boreholes, large enough
+    # to select the factored solver (nSources = 512)
+    field = gt.boreholes.rectangle_field(8, 8, 7.5, 7.5, 150., 4., 0.075)
+    alpha = 1e-6            # Ground thermal diffusivity [m2/s]
+    # Bore field characteristic time [s]
+    ts = 150.**2 / (9 * alpha)
+    # Times for the g-function [s]
+    time = np.array([0.01, 0.1, 1., 10.]) * ts
+    # Public solve() method (dispatches to the factored solver)
+    solver = gt.solvers.Similarities(field, None, time, 'UBWT', nSegments=8)
+    assert solver._identical_vertical_field
+    gFunc = solver.solve(time, alpha)
+    # Dense solver
+    solver_dense = gt.solvers.Similarities(
+        field, None, time, 'UBWT', nSegments=8)
+    solver_dense._identical_vertical_field = False
+    gFunc_dense = solver_dense.solve(time, alpha)
+    assert np.allclose(gFunc, gFunc_dense, rtol=1e-8, atol=1e-8)

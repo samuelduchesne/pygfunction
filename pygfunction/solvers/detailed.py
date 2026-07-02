@@ -233,7 +233,7 @@ class Detailed(_BaseSolver):
 
         # Interp1d object for thermal response factors
         h_ij = interp1d(np.hstack((0., time)), h_ij,
-                        kind=kind, copy=True, axis=2)
+                        kind=kind, copy=False, axis=2)
         toc = perf_counter()
         if self.disp: print(f' {toc - tic:.3f} sec')
 
