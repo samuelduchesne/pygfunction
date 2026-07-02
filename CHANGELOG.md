@@ -5,6 +5,21 @@
 ### Other changes
 
 * Drastically improved the performance of g-function calculations:
+  * The `'similarities'` solver now uses a matrix-free (factored)
+    representation of the matrix of segment-to-segment thermal response
+    factors for large bore fields of identical vertical boreholes under the
+    `'UBWT'` boundary condition. The matrix is expressed as a sum of
+    Kronecker products of sparse borehole adjacency matrices (one per
+    unique borehole-to-borehole distance) with small segment-to-segment
+    interaction blocks, and the systems of equations are solved using the
+    preconditioned conjugate gradient method with a two-level
+    preconditioner (block-Jacobi and borehole-level coarse correction).
+    The dense matrix of thermal response factors is never assembled : both
+    the O(nSources**2) memory and the O(nSources**3) dense factorizations
+    are avoided entirely. This makes very large bore fields tractable
+    (e.g. a field of 2025 boreholes discretized into 24300 segments, whose
+    dense matrix would require 119 GiB of memory, is evaluated in minutes
+    within 2.2 GiB of memory).
   * The finite line source (FLS) solution is now evaluated for all time
     values simultaneously using a fixed Gauss-Legendre quadrature over
     log-spaced panels, replacing per-time-step adaptive quadrature

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
+import warnings
 from time import perf_counter
 
 import numpy as np
 from scipy.interpolate import interp1d as interp1d
+from scipy.sparse import csr_matrix
 
 from ._base_solver import _BaseSolver
 from ..heat_transfer import (
@@ -168,6 +170,7 @@ class Similarities(_BaseSolver):
         """
         self.disTol = disTol
         self.tol = tol
+        self._identical_vertical_field = False
         # Check the validity of inputs
         self._check_solver_specific_inputs()
         # Split boreholes into segments
@@ -175,6 +178,431 @@ class Similarities(_BaseSolver):
         # Initialize similarities
         self.find_similarities()
         return len(self.boreSegments)
+
+    def solve(self, time, alpha):
+        """
+        Build and solve the system of equations.
+
+        For bore fields of identical vertical boreholes under the 'UBWT'
+        boundary condition, the g-function is evaluated using a matrix-free
+        representation of the matrix of segment-to-segment thermal response
+        factors (see :func:`_solve_factored_UBWT`). The base solver is used
+        otherwise.
+
+        Parameters
+        ----------
+        time : float or array
+            Values of time (in seconds) for which the g-function is
+            evaluated.
+        alpha : float
+            Soil thermal diffusivity (in m2/s).
+
+        Returns
+        -------
+        gFunc : float or array
+            Values of the g-function.
+
+        """
+        if (self.boundary_condition == 'UBWT'
+                and self._identical_vertical_field
+                and len(self.boreholes) > 1
+                and not np.isscalar(time)):
+            # The factored solver is used when its matrix-free products are
+            # expected to be significantly cheaper than the dense
+            # factorizations of the base solver, or when the dense matrix
+            # of thermal response factors would exhaust memory. For small
+            # bore fields (or highly irregular bore fields with many unique
+            # distances), the dense solver is faster.
+            nb = len(self.boreholes)
+            nSeg = self.nBoreSegments[0]
+            nDis = len(self.borehole_to_borehole_distances_vertical[0])
+            nt = len(np.atleast_1d(time))
+            matvec_operations = nb**2 * nSeg + nDis * nSeg**2 * nb
+            dense_storage_bytes = 8 * self.nSources**2 * (nt + 2)
+            if ((self.nSources >= 400
+                 and 100 * matvec_operations < self.nSources**3)
+                    or dense_storage_bytes > 2e9):
+                return self._solve_factored_UBWT(time, alpha)
+        return super().solve(time, alpha)
+
+    def _solve_factored_UBWT(self, time, alpha):
+        """
+        Evaluate the g-function for the 'UBWT' boundary condition using a
+        matrix-free (factored) representation of the matrix of
+        segment-to-segment thermal response factors.
+
+        In a bore field of identical vertical boreholes that share the same
+        segment discretization, the matrix of segment-to-segment thermal
+        response factors is fully determined by a small number of unique
+        (nSegments x nSegments) borehole-to-borehole interaction blocks (one
+        per unique borehole-to-borehole distance, plus one for the
+        interaction of a borehole with itself):
+
+            [h] = sum_d [A_d] (x) [B_d] + [I] (x) [B_self]
+
+        where [A_d] is the (sparse) adjacency matrix of borehole pairs
+        separated by the d-th unique distance and (x) is the Kronecker
+        product. The dense matrix of thermal response factors is never
+        assembled. Matrix-vector products are evaluated in
+        O(nBoreholes**2 * nSegments + nDistances * nSegments**2 * nBoreholes)
+        operations, and the systems of equations are solved using the
+        preconditioned conjugate gradient method applied to the scaled
+        symmetric system (see
+        :func:`_BaseSolver._solve_uniform_borehole_wall_temperature` for the
+        Schur complement formulation). The preconditioner combines a
+        (shared) block-Jacobi factorization of the borehole self-interaction
+        block with a borehole-level coarse correction.
+
+        This reduces both the computational and memory complexity of the
+        evaluation of the g-function: the O(nSources**2 * nt) storage of the
+        matrix of thermal response factors and the O(nSources**3) dense
+        factorizations are avoided entirely.
+
+        Parameters
+        ----------
+        time : array
+            Values of time (in seconds) for which the g-function is
+            evaluated.
+        alpha : float
+            Soil thermal diffusivity (in m2/s).
+
+        Returns
+        -------
+        gFunc : array
+            Values of the g-function.
+
+        """
+        # Number of time values
+        self.time = time
+        nt = len(self.time)
+        # Evaluate threshold time for g-function linearization
+        if self.linear_threshold is None:
+            time_threshold = self.r_b_max**2 / (25 * alpha)
+        else:
+            time_threshold = self.linear_threshold
+        # Find the number of g-function values to be linearized
+        p_long = np.searchsorted(self.time, time_threshold, side='right')
+        if p_long > 0:
+            time_long = np.concatenate([[time_threshold], self.time[p_long:]])
+        else:
+            time_long = self.time
+        nt_long = len(time_long)
+        nSeg = self.nBoreSegments[0]
+
+        # Unique blocks of the matrix of thermal response factors
+        if self.disp:
+            print('Calculating segment to segment response factors ...',
+                  end='')
+        tic = perf_counter()
+        B_self, B_dis, Adj, D_idx = self._factored_response_factors(
+            time_long, alpha)
+        toc = perf_counter()
+        if self.disp: print(f' {toc - tic:.3f} sec')
+
+        # Segment lengths
+        H_b = self.segment_lengths()
+        H_tot = np.sum(H_b)
+        H_seg = H_b[0:nSeg]
+        if self.disp:
+            print('Building and solving the system of equations ...', end='')
+        tic = perf_counter()
+        # Initialize g-function
+        gFunc = np.zeros(nt)
+        # Initialize segment heat extraction rates
+        Q_b = np.zeros((self.nSources, nt), dtype=self.dtype)
+        T_b = np.zeros(nt, dtype=self.dtype)
+        # Time values of the thermal response factors (t=0 at index 0)
+        x_t = np.concatenate(([0.], time_long))
+        # Solutions of the previous time step (to warm start the conjugate
+        # gradient iterations)
+        X_1 = None
+        X_2 = None
+
+        # Build and solve the system of equations at all times
+        p0 = max(0, p_long-1)
+        for p in range(nt_long):
+            # Current thermal response factor matrix
+            if p > 0:
+                dt = time_long[p] - time_long[p-1]
+            else:
+                dt = time_long[p]
+            # Thermal response factor blocks evaluated at t=dt
+            jt = min(max(int(np.searchsorted(x_t, dt)), 1), len(x_t) - 1)
+            w = (dt - x_t[jt-1]) / (x_t[jt] - x_t[jt-1])
+            B_self_dt = B_self[jt-1] + w * (B_self[jt] - B_self[jt-1])
+            B_dis_dt = B_dis[jt-1] + w * (B_dis[jt] - B_dis[jt-1])
+            # Reconstructed load history
+            Q_reconstructed = self.load_history_reconstruction(
+                time_long[0:p+1], Q_b[:,p0:p+p0+1])
+            # Borehole wall temperature for zero heat extraction at
+            # current step
+            T_b0 = self._factored_superposition(
+                Adj, B_self, B_dis, Q_reconstructed)
+
+            # Solve the system of equations
+            Q_b[:,p+p0], T_b[p+p0], X_1, X_2 = \
+                self._factored_solve_step(
+                    Adj, D_idx, B_self_dt, B_dis_dt, T_b0, H_seg, H_b,
+                    H_tot, X_1, X_2)
+            gFunc[p+p0] = T_b[p+p0]
+
+        # Linearize g-function for times under threshold
+        if p_long > 0:
+            gFunc[:p_long] = gFunc[p_long-1] * self.time[:p_long] / time_threshold
+            Q_b[:,:p_long] = 1 + (Q_b[:,p_long-1:p_long] - 1) * self.time[:p_long] / time_threshold
+            T_b[:p_long] = T_b[p_long-1] * self.time[:p_long] / time_threshold
+
+        # Store temperature and heat extraction rate profiles
+        if self.profiles:
+            self.Q_b = Q_b
+            self.T_b = T_b
+        toc = perf_counter()
+        if self.disp: print(f' {toc - tic:.3f} sec')
+        return gFunc
+
+    def _factored_response_factors(self, time, alpha):
+        """
+        Evaluate the unique blocks of the matrix of segment-to-segment
+        thermal response factors for a bore field of identical vertical
+        boreholes.
+
+        Parameters
+        ----------
+        time : array
+            Values of time (in seconds) for which the response factors are
+            evaluated.
+        alpha : float
+            Soil thermal diffusivity (in m2/s).
+
+        Returns
+        -------
+        B_self : array, shape (nt+1, nSegments, nSegments)
+            Same-borehole interaction blocks at all time values (with time
+            t=0 at index 0). B_self[k, m, n] is the thermal response factor
+            of segment m due to segment n of the same borehole.
+        B_dis : array, shape (nt+1, nDis, nSegments, nSegments)
+            Borehole-to-borehole interaction blocks for each unique
+            borehole-to-borehole distance at all time values (with time t=0
+            at index 0).
+        Adj : sparse matrix, shape (nDis * nBoreholes, nBoreholes)
+            Stacked adjacency matrices of the unique distances. Row
+            (d * nBoreholes + i) holds ones in the columns of the boreholes
+            j separated from borehole i by the d-th unique distance.
+        D_idx : array, shape (nBoreholes, nBoreholes)
+            Indices of the unique distances for each borehole pair (-1 on
+            the diagonal).
+
+        """
+        nb = len(self.boreholes)
+        nSeg = self.nBoreSegments[0]
+        nt = len(time)
+        # Same-borehole interaction blocks
+        H1, D1, H2, D2, i_pair, j_pair, k_pair = \
+            self._map_axial_segment_pairs_vertical(0, 0)
+        h_self = finite_line_source_vectorized(
+            time, alpha, self.boreholes[0].r_b, H1, D1, H2, D2,
+            approximation=self.approximate_FLS, N=self.nFLS)
+        B_self = np.zeros((nt + 1, nSeg, nSeg))
+        B_self[1:, j_pair, i_pair] = h_self[k_pair, :].T
+        # Borehole-to-borehole interaction blocks at each unique distance
+        pairs = self.borehole_to_borehole_vertical[0]
+        distances = np.asarray(
+            self.borehole_to_borehole_distances_vertical[0])
+        indices = np.asarray(
+            self.borehole_to_borehole_indices_vertical[0], dtype=int)
+        nDis = len(distances)
+        i, j = pairs[0]
+        H1, D1, H2, D2, i_pair, j_pair, k_pair = \
+            self._map_axial_segment_pairs_vertical(i, j)
+        h = finite_line_source_vectorized(
+            time, alpha, distances.reshape(-1, 1),
+            H1.reshape(1, -1), D1.reshape(1, -1),
+            H2.reshape(1, -1), D2.reshape(1, -1),
+            approximation=self.approximate_FLS, N=self.nFLS)
+        B_dis = np.zeros((nt + 1, nDis, nSeg, nSeg))
+        B_dis[1:, :, j_pair, i_pair] = np.moveaxis(h[:, k_pair, :], -1, 0)
+        # Stacked adjacency matrices of the unique distances
+        pairs_array = np.asarray(pairs, dtype=int)
+        i1, j1 = pairs_array[:, 0], pairs_array[:, 1]
+        rows = np.concatenate((indices * nb + i1, indices * nb + j1))
+        cols = np.concatenate((j1, i1))
+        Adj = csr_matrix(
+            (np.ones(len(rows)), (rows, cols)), shape=(nDis * nb, nb))
+        # Indices of the unique distances for each borehole pair
+        D_idx = np.full((nb, nb), -1, dtype=int)
+        D_idx[i1, j1] = indices
+        D_idx[j1, i1] = indices
+        return B_self, B_dis, Adj, D_idx
+
+    def _factored_superposition(self, Adj, B_self, B_dis, Q_reconstructed):
+        """
+        Temporal superposition for inequal time steps, evaluated from the
+        factored representation of the matrix of thermal response factors.
+
+        Parameters
+        ----------
+        Adj : sparse matrix
+            Stacked adjacency matrices of the unique distances.
+        B_self : array
+            Same-borehole interaction blocks (time t=0 at index 0).
+        B_dis : array
+            Borehole-to-borehole interaction blocks (time t=0 at index 0).
+        Q_reconstructed : array
+            Reconstructed heat extraction rates of all segments at all
+            times.
+
+        Returns
+        -------
+        T_b0 : array
+            Current values of borehole wall temperatures assuming no heat
+            extraction during current time step.
+
+        """
+        nDis = B_dis.shape[1]
+        nSeg = B_dis.shape[2]
+        nb = Q_reconstructed.shape[0] // nSeg
+        # Number of time steps
+        nt = Q_reconstructed.shape[1]
+        # Time-reversed heat extraction rate increments
+        dQ = np.concatenate(
+            (Q_reconstructed[:,0:1],
+             Q_reconstructed[:,1:] - Q_reconstructed[:,0:-1]),
+            axis=1)[:,::-1]
+        X = np.ascontiguousarray(dQ).reshape(nb, nSeg, nt)
+        Z = (Adj @ X.reshape(nb, nSeg * nt)).reshape(nDis, nb, nSeg, nt)
+        # Borehole wall temperature. The sums over the interaction blocks,
+        # segments and time steps are evaluated as single matrix-matrix
+        # products.
+        B_flat = np.ascontiguousarray(
+            B_dis[1:nt+1].transpose(2, 1, 3, 0)).reshape(nSeg, -1)
+        Z_flat = np.ascontiguousarray(
+            Z.transpose(0, 2, 3, 1)).reshape(-1, nb)
+        B_self_flat = np.ascontiguousarray(
+            B_self[1:nt+1].transpose(1, 2, 0)).reshape(nSeg, -1)
+        X_flat = np.ascontiguousarray(X.transpose(1, 2, 0)).reshape(-1, nb)
+        T_b0 = (B_flat @ Z_flat + B_self_flat @ X_flat).T
+        return T_b0.flatten()
+
+    def _factored_solve_step(
+            self, Adj, D_idx, B_self_dt, B_dis_dt, T_b0, H_seg, H_b, H_tot,
+            X_1_previous, X_2_previous):
+        """
+        Solve the system of equations of the 'UBWT' boundary condition at a
+        single time step from the factored representation of the matrix of
+        thermal response factors.
+
+        The Schur complement formulation of
+        :func:`_BaseSolver._solve_uniform_borehole_wall_temperature` is
+        used. The two systems of equations (for [X_1] and [X_2]) are solved
+        using the preconditioned conjugate gradient method with matrix-free
+        products of the scaled symmetric matrix
+        [S] = diag([H_b]) @ [h_dt]. The preconditioner combines a
+        block-Jacobi factorization of the (shared) borehole
+        self-interaction block with a borehole-level coarse correction.
+
+        Parameters
+        ----------
+        Adj : sparse matrix
+            Stacked adjacency matrices of the unique distances.
+        D_idx : array
+            Indices of the unique distances for each borehole pair.
+        B_self_dt : array
+            Same-borehole interaction block at the current time step.
+        B_dis_dt : array
+            Borehole-to-borehole interaction blocks at the current time
+            step.
+        T_b0 : array
+            Borehole wall temperatures assuming no heat extraction during
+            the current time step.
+        H_seg : array
+            Segment lengths (in m) along a borehole.
+        H_b : array
+            Segment lengths (in m) of all segments.
+        H_tot : float
+            Total length of the segments (in m).
+        X_1_previous : array or None
+            Solution of the first system of equations at the previous time
+            step, used to warm start the iterations.
+        X_2_previous : array or None
+            Solution of the second system of equations at the previous time
+            step, used to warm start the iterations.
+
+        Returns
+        -------
+        Q_b : array
+            Segment heat extraction rates.
+        T_b : float
+            Borehole wall temperature.
+        X_1 : array
+            Solution of the first system of equations.
+        X_2 : array
+            Solution of the second system of equations.
+
+        """
+        nb = D_idx.shape[0]
+        nSeg = len(H_seg)
+        nDis = B_dis_dt.shape[0]
+        # Row-scaled (symmetric) blocks
+        S_self = H_seg[:, np.newaxis] * B_self_dt
+        S_dis = H_seg[np.newaxis, :, np.newaxis] * B_dis_dt
+        S_flat = np.ascontiguousarray(
+            S_dis.transpose(1, 0, 2)).reshape(nSeg, nDis * nSeg)
+
+        # Matrix-free product of the scaled matrix of thermal response
+        # factors, applied simultaneously to all right-hand sides. The
+        # sums over the interaction blocks and segments are evaluated as
+        # single matrix-matrix products.
+        def matvec(X):
+            # X : array of shape (nb, nSeg, nRHS)
+            nRHS = X.shape[-1]
+            Z = (Adj @ X.reshape(nb, nSeg * nRHS)).reshape(
+                nDis, nb, nSeg, nRHS)
+            Z_flat = np.ascontiguousarray(
+                Z.transpose(0, 2, 1, 3)).reshape(nDis * nSeg, nb * nRHS)
+            X_flat = np.ascontiguousarray(
+                X.transpose(1, 0, 2)).reshape(nSeg, nb * nRHS)
+            Y = (S_flat @ Z_flat + S_self @ X_flat).reshape(
+                nSeg, nb, nRHS)
+            return np.ascontiguousarray(Y.transpose(1, 0, 2))
+
+        # Preconditioner : block-Jacobi (shared self-interaction block)
+        # and borehole-level coarse correction. The inverses are only used
+        # as preconditioners : the accuracy of the solution is set by the
+        # convergence tolerance of the conjugate gradient iterations.
+        J_inv = np.linalg.inv(S_self)
+        c_dis = S_dis.sum(axis=(1, 2))
+        S_coarse = c_dis[np.maximum(D_idx, 0)]
+        np.fill_diagonal(S_coarse, S_self.sum())
+        C_inv = np.linalg.inv(S_coarse)
+
+        def precond(R):
+            # R : array of shape (nb, nSeg, nRHS)
+            nRHS = R.shape[-1]
+            R_flat = np.ascontiguousarray(
+                R.transpose(1, 0, 2)).reshape(nSeg, nb * nRHS)
+            Z = (J_inv @ R_flat).reshape(nSeg, nb, nRHS).transpose(1, 0, 2)
+            Z_coarse = C_inv @ R.sum(axis=1).reshape(nb, nRHS)
+            return Z + Z_coarse[:, np.newaxis, :]
+
+        # Solve the two systems of equations of the Schur complement
+        # simultaneously
+        B = np.stack(
+            (H_b.reshape(nb, nSeg),
+             (H_b * T_b0).reshape(nb, nSeg)),
+            axis=-1)
+        if X_1_previous is None:
+            X0 = None
+        else:
+            X0 = np.stack(
+                (X_1_previous.reshape(nb, nSeg),
+                 X_2_previous.reshape(nb, nSeg)),
+                axis=-1)
+        X, _ = _pcg(matvec, precond, B, x0=X0)
+        X_1 = X[:, :, 0].flatten()
+        X_2 = X[:, :, 1].flatten()
+        T_b = (H_tot + H_b @ X_2) / (H_b @ X_1)
+        Q_b = T_b * X_1 - X_2
+        return Q_b, T_b, X_1, X_2
 
     def thermal_response_factors(self, time, alpha, kind='linear'):
         """
@@ -855,6 +1283,7 @@ class Similarities(_BaseSolver):
                 and all(b.is_vertical() for b in boreholes)
                 and all(self._compare_boreholes(b, boreholes[0])
                         for b in boreholes[1:])):
+            self._identical_vertical_field = True
             borehole_to_self_vertical = [list(range(nBoreholes))]
             borehole_to_borehole_vertical = [
                 [(i, j)
@@ -1356,3 +1785,74 @@ class Similarities(_BaseSolver):
         assert isinstance(self.tol, (np.floating, float)) and self.tol > 0., \
             "The relative tolerance 'tol' should be a positive float."
         return
+
+
+def _pcg(matvec, precond, B, x0=None, rtol=1.0e-11, maxiter=1000):
+    """
+    Solve symmetric positive definite systems of equations using the
+    preconditioned conjugate gradient method.
+
+    All right-hand sides are solved simultaneously (with independent
+    conjugate gradient scalars for each right-hand side) so that the cost
+    of the matrix products is shared between the right-hand sides.
+
+    Parameters
+    ----------
+    matvec : callable
+        Matrix product of the coefficient matrix. Accepts and returns
+        arrays of shape (..., nRHS).
+    precond : callable
+        Application of the (symmetric positive definite) preconditioner.
+        Accepts and returns arrays of shape (..., nRHS).
+    B : array, shape (..., nRHS)
+        Right-hand sides of the systems of equations.
+    x0 : array or None, optional
+        Initial guess for the solutions.
+        Default is None (i.e. vectors of zeros).
+    rtol : float, optional
+        Relative residual tolerance on the solutions,
+        i.e. norm(B_i - A @ x_i) <= rtol * norm(B_i) for each right-hand
+        side i.
+        Default is 1.0e-11.
+    maxiter : int, optional
+        Maximum number of iterations.
+        Default is 1000.
+
+    Returns
+    -------
+    x : array, shape (..., nRHS)
+        Solutions of the systems of equations.
+    nIterations : int
+        Number of iterations.
+
+    """
+    sum_axes = tuple(range(B.ndim - 1))
+    norm_B = np.sqrt(np.sum(B**2, axis=sum_axes))
+    tolerance = np.maximum(rtol * norm_B, 1e-300)
+    if x0 is None:
+        x = np.zeros_like(B)
+        r = B.copy()
+    else:
+        x = x0.copy()
+        r = B - matvec(x)
+    z = precond(r)
+    p = z.copy()
+    rz = np.sum(r * z, axis=sum_axes)
+    for nIterations in range(maxiter):
+        if np.all(np.sqrt(np.sum(r**2, axis=sum_axes)) <= tolerance):
+            return x, nIterations
+        Ap = matvec(p)
+        pAp = np.sum(p * Ap, axis=sum_axes)
+        alpha = np.where(pAp > 0., rz / np.where(pAp > 0., pAp, 1.), 0.)
+        x += alpha * p
+        r -= alpha * Ap
+        z = precond(r)
+        rz, rz_previous = np.sum(r * z, axis=sum_axes), rz
+        beta = np.where(
+            rz_previous > 0., rz / np.where(rz_previous > 0., rz_previous, 1.), 0.)
+        p = z + beta * p
+    warnings.warn(
+        'The conjugate gradient iterations did not converge to the '
+        'required tolerance. The g-function accuracy may be reduced.',
+        RuntimeWarning)
+    return x, maxiter
