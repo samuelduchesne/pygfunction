@@ -155,6 +155,12 @@ class Similarities(_BaseSolver):
        rate and reversible flow direction. Renewable Energy, 228, 120661.
 
     """
+    # Thresholds for the selection of the factored solver over the dense
+    # solver (see :func:`solve`)
+    _factored_solver_min_nSources = 400
+    _factored_solver_operations_ratio = 100
+    _factored_solver_max_dense_storage = 2e9
+
     def initialize(self, disTol=0.01, tol=1.0e-6, **kwargs):
         """
         Split boreholes into segments and identify similarities in the
@@ -204,6 +210,7 @@ class Similarities(_BaseSolver):
 
         """
         if (self.boundary_condition == 'UBWT'
+                and self.kind == 'linear'
                 and self._identical_vertical_field
                 and len(self.boreholes) > 1
                 and not np.isscalar(time)):
@@ -219,9 +226,11 @@ class Similarities(_BaseSolver):
             nt = len(np.atleast_1d(time))
             matvec_operations = nb**2 * nSeg + nDis * nSeg**2 * nb
             dense_storage_bytes = 8 * self.nSources**2 * (nt + 2)
-            if ((self.nSources >= 400
-                 and 100 * matvec_operations < self.nSources**3)
-                    or dense_storage_bytes > 2e9):
+            if ((self.nSources >= self._factored_solver_min_nSources
+                 and self._factored_solver_operations_ratio
+                     * matvec_operations < self.nSources**3)
+                    or (dense_storage_bytes
+                        > self._factored_solver_max_dense_storage)):
                 return self._solve_factored_UBWT(time, alpha)
         return super().solve(time, alpha)
 
@@ -296,6 +305,15 @@ class Similarities(_BaseSolver):
         tic = perf_counter()
         B_self, B_dis, Adj, D_idx = self._factored_response_factors(
             time_long, alpha)
+        nDis = B_dis.shape[1]
+        # Time-major flattened copies of the interaction blocks used for
+        # temporal superposition. The column index cycles through
+        # (time, distance, segment) -- with time as the slowest index --
+        # so that the history up to any time step is a contiguous view.
+        B_dis_flat = np.ascontiguousarray(
+            B_dis[1:].transpose(2, 0, 1, 3)).reshape(nSeg, -1)
+        B_self_flat = np.ascontiguousarray(
+            B_self[1:].transpose(1, 0, 2)).reshape(nSeg, -1)
         toc = perf_counter()
         if self.disp: print(f' {toc - tic:.3f} sec')
 
@@ -337,7 +355,7 @@ class Similarities(_BaseSolver):
             # Borehole wall temperature for zero heat extraction at
             # current step
             T_b0 = self._factored_superposition(
-                Adj, B_self, B_dis, Q_reconstructed)
+                Adj, B_self_flat, B_dis_flat, nDis, Q_reconstructed)
 
             # Solve the system of equations
             Q_b[:,p+p0], T_b[p+p0], X_1, X_2 = \
@@ -434,7 +452,8 @@ class Similarities(_BaseSolver):
         D_idx[j1, i1] = indices
         return B_self, B_dis, Adj, D_idx
 
-    def _factored_superposition(self, Adj, B_self, B_dis, Q_reconstructed):
+    def _factored_superposition(
+            self, Adj, B_self_flat, B_dis_flat, nDis, Q_reconstructed):
         """
         Temporal superposition for inequal time steps, evaluated from the
         factored representation of the matrix of thermal response factors.
@@ -443,10 +462,14 @@ class Similarities(_BaseSolver):
         ----------
         Adj : sparse matrix
             Stacked adjacency matrices of the unique distances.
-        B_self : array
-            Same-borehole interaction blocks (time t=0 at index 0).
-        B_dis : array
-            Borehole-to-borehole interaction blocks (time t=0 at index 0).
+        B_self_flat : array
+            Time-major flattened same-borehole interaction blocks, shape
+            (nSegments, nt * nSegments).
+        B_dis_flat : array
+            Time-major flattened borehole-to-borehole interaction blocks,
+            shape (nSegments, nt * nDis * nSegments).
+        nDis : int
+            Number of unique borehole-to-borehole distances.
         Q_reconstructed : array
             Reconstructed heat extraction rates of all segments at all
             times.
@@ -458,8 +481,7 @@ class Similarities(_BaseSolver):
             extraction during current time step.
 
         """
-        nDis = B_dis.shape[1]
-        nSeg = B_dis.shape[2]
+        nSeg = B_self_flat.shape[0]
         nb = Q_reconstructed.shape[0] // nSeg
         # Number of time steps
         nt = Q_reconstructed.shape[1]
@@ -472,15 +494,13 @@ class Similarities(_BaseSolver):
         Z = (Adj @ X.reshape(nb, nSeg * nt)).reshape(nDis, nb, nSeg, nt)
         # Borehole wall temperature. The sums over the interaction blocks,
         # segments and time steps are evaluated as single matrix-matrix
-        # products.
-        B_flat = np.ascontiguousarray(
-            B_dis[1:nt+1].transpose(2, 1, 3, 0)).reshape(nSeg, -1)
+        # products, with the time steps matched to the (contiguous)
+        # time-major history of the flattened interaction blocks.
         Z_flat = np.ascontiguousarray(
-            Z.transpose(0, 2, 3, 1)).reshape(-1, nb)
-        B_self_flat = np.ascontiguousarray(
-            B_self[1:nt+1].transpose(1, 2, 0)).reshape(nSeg, -1)
-        X_flat = np.ascontiguousarray(X.transpose(1, 2, 0)).reshape(-1, nb)
-        T_b0 = (B_flat @ Z_flat + B_self_flat @ X_flat).T
+            Z.transpose(3, 0, 2, 1)).reshape(-1, nb)
+        X_flat = np.ascontiguousarray(X.transpose(2, 1, 0)).reshape(-1, nb)
+        T_b0 = (B_dis_flat[:, :nt*nDis*nSeg] @ Z_flat
+                + B_self_flat[:, :nt*nSeg] @ X_flat).T
         return T_b0.flatten()
 
     def _factored_solve_step(
@@ -1283,7 +1303,8 @@ class Similarities(_BaseSolver):
                 and all(b.is_vertical() for b in boreholes)
                 and all(self._compare_boreholes(b, boreholes[0])
                         for b in boreholes[1:])):
-            self._identical_vertical_field = True
+            if boreholes is self.boreholes:
+                self._identical_vertical_field = True
             borehole_to_self_vertical = [list(range(nBoreholes))]
             borehole_to_borehole_vertical = [
                 [(i, j)
@@ -1843,13 +1864,14 @@ def _pcg(matvec, precond, B, x0=None, rtol=1.0e-11, maxiter=1000):
             return x, nIterations
         Ap = matvec(p)
         pAp = np.sum(p * Ap, axis=sum_axes)
-        alpha = np.where(pAp > 0., rz / np.where(pAp > 0., pAp, 1.), 0.)
+        alpha = np.divide(
+            rz, pAp, out=np.zeros_like(rz), where=pAp > 0.)
         x += alpha * p
         r -= alpha * Ap
         z = precond(r)
         rz, rz_previous = np.sum(r * z, axis=sum_axes), rz
-        beta = np.where(
-            rz_previous > 0., rz / np.where(rz_previous > 0., rz_previous, 1.), 0.)
+        beta = np.divide(
+            rz, rz_previous, out=np.zeros_like(rz), where=rz_previous > 0.)
         p = z + beta * p
     warnings.warn(
         'The conjugate gradient iterations did not converge to the '

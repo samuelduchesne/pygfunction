@@ -242,10 +242,11 @@ class _BaseSolver:
         nt_long = len(time_long)
         # Calculate segment to segment thermal response factors
         h_ij = self.thermal_response_factors(time_long, alpha, kind=self.kind)
-        # Transposed contiguous copy of the thermal response factors, used
-        # for fast interpolation and temporal superposition. The first index
-        # corresponds to time (with time t=0 at index 0).
-        h_ij_T = np.ascontiguousarray(np.moveaxis(h_ij.y, -1, 0))
+        if self.boundary_condition in ('UBWT', 'MIFT'):
+            # Transposed contiguous copy of the thermal response factors,
+            # used for fast interpolation and temporal superposition. The
+            # first index corresponds to time (with time t=0 at index 0).
+            h_ij_T = np.ascontiguousarray(np.moveaxis(h_ij.y, -1, 0))
         # Segment lengths
         H_b = self.segment_lengths()
         if self.boundary_condition == 'MIFT':
@@ -271,7 +272,7 @@ class _BaseSolver:
                 # boreholes
 
                 # Thermal response factors evaluated at time t[p]
-                h_dt = h_ij_T[p+1]
+                h_dt = h_ij.y[:,:,p+1]
                 # Borehole wall temperatures are calculated by the sum of
                 # contributions of all segments
                 T_b[:,p+p0] = np.sum(h_dt, axis=1)
@@ -561,6 +562,14 @@ class _BaseSolver:
         """
         # Scaled (symmetric) matrix of thermal response factors
         S = h_dt * H_b[:, np.newaxis]
+        # The scaled matrix is exactly symmetric for vertical boreholes. For
+        # inclined boreholes, reciprocity is only satisfied to the accuracy
+        # of the quadrature along the emitting heat sources : the matrix is
+        # explicitly symmetrized to average the two quadrature evaluations
+        # of each segment pair (the Cholesky factorization only reads one
+        # triangle of the matrix).
+        if any(b.is_tilted() for b in self.boreholes):
+            S = 0.5 * (S + S.T)
         try:
             # Cholesky factorization
             factorization = cho_factor(
