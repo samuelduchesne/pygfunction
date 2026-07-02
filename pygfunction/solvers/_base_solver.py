@@ -3,6 +3,7 @@ from time import perf_counter
 
 import numpy as np
 from scipy.interpolate import interp1d as interp1d
+from scipy.linalg import cho_factor, cho_solve
 
 from ..borefield import Borefield
 from ..boreholes import Borehole
@@ -293,7 +294,7 @@ class _BaseSolver:
             # Evaluate the g-function with uniform borehole wall
             # temperature
             # ---------------------------------------------------------
-            # Build a system of equation [A]*[X] = [B] for the
+            # Solve a system of equations [A]*[X] = [B] for the
             # evaluation of the g-function. [A] is a coefficient
             # matrix, [X] = [Q_b,T_b] is a state space vector of the
             # borehole heat extraction rates and borehole wall
@@ -303,16 +304,6 @@ class _BaseSolver:
             # Spatial superposition: [T_b] = [T_b0] + [h_ij_dt]*[Q_b]
             # Energy conservation: sum([Q_b*Hb]) = sum([Hb])
             # ---------------------------------------------------------
-            # Initialize coefficient matrix and vector. The (constant)
-            # coefficients are set once and the thermal response factors
-            # are updated at each time step.
-            A = np.empty(
-                (self.nSources + 1, self.nSources + 1), dtype=self.dtype)
-            A[:-1, -1] = -1.
-            A[-1, :-1] = H_b
-            A[-1, -1] = 0.
-            B = np.empty(self.nSources + 1, dtype=self.dtype)
-            B[-1] = H_tot
 
             # Build and solve the system of equations at all times
             p0 = max(0, p_long-1)
@@ -333,14 +324,12 @@ class _BaseSolver:
                 T_b0 = self._temporal_superposition_transposed(
                     h_ij_T, Q_reconstructed)
 
-                A[:-1, :-1] = h_dt
-                B[:-1] = -T_b0
                 # Solve the system of equations
-                X = np.linalg.solve(A, B)
                 # Store calculated heat extraction rates
-                Q_b[:,p+p0] = X[0:self.nSources]
                 # The borehole wall temperatures are equal for all segments
-                T_b[p+p0] = X[-1]
+                Q_b[:,p+p0], T_b[p+p0] = \
+                    self._solve_uniform_borehole_wall_temperature(
+                        h_dt, T_b0, H_b, H_tot)
                 gFunc[p+p0] = T_b[p+p0]
 
             # Linearize g-function for times under threshold
@@ -520,6 +509,81 @@ class _BaseSolver:
             boreSegments.extend(segments)
 
         return boreSegments
+
+    def _solve_uniform_borehole_wall_temperature(
+            self, h_dt, T_b0, H_b, H_tot):
+        """
+        Solve the system of equations for the 'UBWT' boundary condition at
+        a single time step.
+
+        The system of equations:
+
+            [h_dt] @ [Q_b] - [1] * T_b = -[T_b0]
+            [H_b] @ [Q_b] = H_tot
+
+        is solved through a Schur complement. By reciprocity of the thermal
+        response factors (H_i * h_ij = H_j * h_ji), the scaled matrix
+        [S] = diag([H_b]) @ [h_dt] is symmetric. The system is then solved
+        using a Cholesky factorization of [S] (at half the operation count
+        of the LU factorization of the bordered system), with two
+        simultaneous right-hand sides:
+
+            [X_1] = [S]^-1 @ [H_b]
+            [X_2] = [S]^-1 @ ([H_b] * [T_b0])
+
+            T_b = (H_tot + [H_b] @ [X_2]) / ([H_b] @ [X_1])
+            [Q_b] = T_b * [X_1] - [X_2]
+
+        If the Cholesky factorization fails (i.e. if the scaled matrix of
+        thermal response factors is not positive definite), the bordered
+        system is solved directly using an LU factorization.
+
+        Parameters
+        ----------
+        h_dt : array
+            Matrix of segment-to-segment thermal response factor increments
+            at the given time step.
+        T_b0 : array
+            Borehole wall temperatures assuming no heat extraction during
+            the current time step.
+        H_b : array
+            Array of segment lengths (in m).
+        H_tot : float
+            Total length of the segments (in m).
+
+        Returns
+        -------
+        Q_b : array
+            Segment heat extraction rates.
+        T_b : float
+            Borehole wall temperature.
+
+        """
+        # Scaled (symmetric) matrix of thermal response factors
+        S = h_dt * H_b[:, np.newaxis]
+        try:
+            # Cholesky factorization
+            factorization = cho_factor(
+                S, lower=True, overwrite_a=True, check_finite=False)
+            X = cho_solve(
+                factorization,
+                np.column_stack((H_b, H_b * T_b0)),
+                check_finite=False)
+            X_1 = X[:, 0]
+            X_2 = X[:, 1]
+            T_b = (H_tot + H_b @ X_2) / (H_b @ X_1)
+            Q_b = T_b * X_1 - X_2
+        except np.linalg.LinAlgError:
+            # The scaled matrix of thermal response factors is not positive
+            # definite. Solve the bordered system directly.
+            A = np.block(
+                [[h_dt, -np.ones((self.nSources, 1), dtype=self.dtype)],
+                 [H_b, 0.]])
+            B = np.hstack((-T_b0, H_tot))
+            X = np.linalg.solve(A, B)
+            Q_b = X[0:self.nSources]
+            T_b = X[-1]
+        return Q_b, T_b
 
     def _interpolate_thermal_response_factors(self, h_ij, h_ij_T, dt):
         """

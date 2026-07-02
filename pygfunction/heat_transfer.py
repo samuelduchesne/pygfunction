@@ -2,7 +2,6 @@
 from functools import lru_cache
 
 import numpy as np
-from scipy.integrate import quad, quad_vec
 from scipy.special import erfc, erf, roots_legendre
 
 from .boreholes import Borehole
@@ -707,7 +706,8 @@ def finite_line_source_vectorized(
     Notes
     -----
     This is a vectorized version of the :func:`finite_line_source` function
-    using scipy.integrate.quad_vec to speed up calculations. All arrays
+    using a fixed Gauss-Legendre quadrature over log-spaced panels to
+    evaluate the integrals at all time values simultaneously. All arrays
     (dis, H1, D1, H2, D2) must follow numpy array broadcasting rules. If time
     is an array, the integrals for different time values are stacked on the
     last axis.
@@ -821,7 +821,8 @@ def finite_line_source_equivalent_boreholes_vectorized(
     Notes
     -----
     This is a vectorized version of the :func:`finite_line_source` function
-    using scipy.integrate.quad_vec to speed up calculations. All arrays
+    using a fixed Gauss-Legendre quadrature over log-spaced panels to
+    evaluate the integrals at all time values simultaneously. All arrays
     (dis, H1, D1, H2, D2) must follow numpy array broadcasting rules. If time
     is an array, the integrals for different time values are stacked on the
     last axis.
@@ -993,7 +994,8 @@ def finite_line_source_inclined_vectorized(
     Notes
     -----
     This is a vectorized version of the :func:`finite_line_source` function
-    using scipy.integrate.quad_vec to speed up calculations. All arrays
+    using a fixed Gauss-Legendre quadrature over log-spaced panels to
+    evaluate the integrals at all time values simultaneously. All arrays
     (x1, y1, H1, D1, tilt1, orientation1, x2, y2, H2, D2, tilt2,
     orientation2) must follow numpy array broadcasting rules.
 

@@ -2,6 +2,30 @@
 
 ## Version 2.4 (in development)
 
+### Other changes
+
+* Drastically improved the performance of g-function calculations:
+  * The finite line source (FLS) solution is now evaluated for all time
+    values simultaneously using a fixed Gauss-Legendre quadrature over
+    log-spaced panels, replacing per-time-step adaptive quadrature
+    (`scipy.integrate.quad`/`quad_vec`). Accuracy is improved compared to
+    the adaptive scheme.
+  * The evaluation of the FLS solution deduplicates the coefficients of the
+    integrand, reducing the number of transcendental function evaluations.
+    This drastically accelerates the `'detailed'` solver.
+  * The systems of equations of the `'UBWT'` boundary condition are now
+    solved using a Cholesky factorization of the symmetrically-scaled
+    matrix of thermal response factors through a Schur complement, at half
+    the operation count of the LU factorization of the bordered system.
+  * Temporal superposition and interpolation of thermal response factors
+    are evaluated on a time-transposed contiguous copy of the matrix of
+    thermal response factors, and the coefficient matrices of the systems
+    of equations are preallocated instead of rebuilt at every time step.
+  * The `'similarities'` solver skips finite line source evaluations for
+    empty similarity groups, uses a fast path for bore fields of identical
+    vertical boreholes, and vectorizes the calculation of
+    borehole-to-borehole distances.
+
 ## Version 2.3.1 (2025-08-04)
 
 ### New features
