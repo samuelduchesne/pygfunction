@@ -234,6 +234,38 @@ class Similarities(_BaseSolver):
                 return self._solve_factored_UBWT(time, alpha)
         return super().solve(time, alpha)
 
+    def _fls_kernel(self, time, alpha, dis, H1, D1, H2, D2):
+        """
+        Evaluate the finite line source solution for vertical boreholes.
+
+        This method serves as a hook for subclasses that solve the
+        g-function in a transformed domain (e.g. the Laplace domain, where
+        the `time` argument holds values of the Laplace parameter).
+
+        Parameters
+        ----------
+        time : float or array
+            Values of time (in seconds) for which the FLS solution is
+            evaluated.
+        alpha : float
+            Soil thermal diffusivity (in m2/s).
+        dis : float or array
+            Radial distances to evaluate the FLS solution.
+        H1, D1, H2, D2 : float or array
+            Lengths and buried depths of the emitting and receiving heat
+            sources.
+
+        Returns
+        -------
+        h : array
+            Values of the FLS solution, with time (or the Laplace
+            parameter) stacked on the last axis.
+
+        """
+        return finite_line_source_vectorized(
+            time, alpha, dis, H1, D1, H2, D2,
+            approximation=self.approximate_FLS, N=self.nFLS)
+
     def _solve_factored_UBWT(self, time, alpha):
         """
         Evaluate the g-function for the 'UBWT' boundary condition using a
@@ -417,9 +449,8 @@ class Similarities(_BaseSolver):
         # Same-borehole interaction blocks
         H1, D1, H2, D2, i_pair, j_pair, k_pair = \
             self._map_axial_segment_pairs_vertical(0, 0)
-        h_self = finite_line_source_vectorized(
-            time, alpha, self.boreholes[0].r_b, H1, D1, H2, D2,
-            approximation=self.approximate_FLS, N=self.nFLS)
+        h_self = self._fls_kernel(
+            time, alpha, self.boreholes[0].r_b, H1, D1, H2, D2)
         B_self = np.zeros((nt + 1, nSeg, nSeg))
         B_self[1:, j_pair, i_pair] = h_self[k_pair, :].T
         # Borehole-to-borehole interaction blocks at each unique distance
@@ -432,11 +463,10 @@ class Similarities(_BaseSolver):
         i, j = pairs[0]
         H1, D1, H2, D2, i_pair, j_pair, k_pair = \
             self._map_axial_segment_pairs_vertical(i, j)
-        h = finite_line_source_vectorized(
+        h = self._fls_kernel(
             time, alpha, distances.reshape(-1, 1),
             H1.reshape(1, -1), D1.reshape(1, -1),
-            H2.reshape(1, -1), D2.reshape(1, -1),
-            approximation=self.approximate_FLS, N=self.nFLS)
+            H2.reshape(1, -1), D2.reshape(1, -1))
         B_dis = np.zeros((nt + 1, nDis, nSeg, nSeg))
         B_dis[1:, :, j_pair, i_pair] = np.moveaxis(h[:, k_pair, :], -1, 0)
         # Stacked adjacency matrices of the unique distances
@@ -710,9 +740,7 @@ class Similarities(_BaseSolver):
             H2 = H2.reshape(1, -1)
             D1 = D1.reshape(1, -1)
             D2 = D2.reshape(1, -1)
-            h = finite_line_source_vectorized(
-                time, alpha, dis, H1, D1, H2, D2,
-                approximation=self.approximate_FLS, N=self.nFLS)
+            h = self._fls_kernel(time, alpha, dis, H1, D1, H2, D2)
             # Broadcast values to h_ij matrix
             h_ij[j_segment, i_segment, 1:] = h[l_segment, k_segment, :]
             if (self._compare_boreholes(self.boreholes[j], self.boreholes[i]) and
@@ -964,9 +992,7 @@ class Similarities(_BaseSolver):
             k_segment = np.append(k_segment, k_segment_i + k0)
             k0 += np.max(k_pair) + 1
         # Evaluate FLS at all time steps
-        h = finite_line_source_vectorized(
-            time, alpha, dis, H1, D1, H2, D2,
-            approximation=self.approximate_FLS, N=self.nFLS)
+        h = self._fls_kernel(time, alpha, dis, H1, D1, H2, D2)
         return h, i_segment, j_segment, k_segment
 
     def find_similarities(self):

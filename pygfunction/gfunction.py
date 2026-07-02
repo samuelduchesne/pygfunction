@@ -14,6 +14,7 @@ from .networks import Network
 from .solvers import (
     Detailed,
     Equivalent,
+    Laplace,
     Similarities
 )
 from .utilities import (
@@ -64,6 +65,18 @@ class gFunction(object):
                 equivalent borehole and the group-to-group thermal interactions
                 are calculated by the FLS solution. This is an approximation of
                 the 'similarities' method.
+            - 'laplace' :
+                Evaluation of the g-function in the Laplace domain, where
+                the temporal superposition of the FLS solution reduces to
+                an algebraic product. The g-function is reconstructed as a
+                sum of decaying exponentials from independent
+                (history-free) solutions at sampled values of the Laplace
+                parameter. This evaluates the exact continuous-time
+                g-function (for the spatial discretization at hand), while
+                the time-marching methods use piecewise-constant heat
+                extraction rates over the time steps. Only the 'UHTR' and
+                'UBWT' boundary conditions and vertical boreholes are
+                supported.
 
         Default is 'equivalent'.
     boundary_condition : str, optional
@@ -275,6 +288,11 @@ class gFunction(object):
                 self.m_flow_network, self.cp_f, **self.options)
         elif self.method.lower()=='equivalent':
             self.solver = Equivalent(
+                self.boreholes, self.network, self.time,
+                self.boundary_condition, self.m_flow_borehole,
+                self.m_flow_network, self.cp_f, **self.options)
+        elif self.method.lower()=='laplace':
+            self.solver = Laplace(
                 self.boreholes, self.network, self.time,
                 self.boundary_condition, self.m_flow_borehole,
                 self.m_flow_network, self.cp_f, **self.options)
@@ -1498,7 +1516,7 @@ class gFunction(object):
         assert type(self.boundary_condition) is str and self.boundary_condition in acceptable_boundary_conditions, \
             f"Boundary condition '{self.boundary_condition}' is not an acceptable boundary condition. \n" \
             f"Please provide one of the following inputs : {acceptable_boundary_conditions}"
-        acceptable_methods = ['detailed', 'similarities', 'equivalent']
+        acceptable_methods = ['detailed', 'similarities', 'equivalent', 'laplace']
         assert type(self.method) is str and self.method in acceptable_methods, \
             f"Method '{self.method}' is not an acceptable method. \n" \
             f"Please provide one of the following inputs : {acceptable_methods}"

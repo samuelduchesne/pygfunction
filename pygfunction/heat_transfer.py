@@ -1233,6 +1233,163 @@ def _finite_line_source_integral_all_times(
     return integrals
 
 
+def _finite_line_source_laplace(
+        p, alpha, dis, H1, D1, H2, D2, reaSource=True, imgSource=True):
+    """
+    Evaluate the Laplace-domain transfer function of the Finite Line Source
+    (FLS) solution.
+
+    The FLS solution is expressed by an integral over the variable s with a
+    sharp cutoff in time:
+
+        h(t) = int_0^inf f(s) * u(t - 1 / (4 * alpha * s**2)) ds
+
+    where u is the unit step function. The Laplace-domain transfer function
+    (i.e. p times the Laplace transform of the step response h) follows by
+    transforming the step function:
+
+        p * L{h}(p) = int_0^inf f(s) * exp(-p / (4 * alpha * s**2)) ds
+
+    i.e. the same integrand f(s) weighted by a smooth exponential factor.
+    At p = 0, the transfer function equals the steady-state FLS solution.
+
+    Parameters
+    ----------
+    p : float or array, shape (nP,)
+        Laplace parameter (in 1/seconds). Must be real and non-negative.
+    alpha : float
+        Soil thermal diffusivity (in m2/s).
+    dis : float or array
+        Radial distances to evaluate the FLS solution.
+    H1 : float or array
+        Lengths of the emitting heat sources.
+    D1 : float or array
+        Buried depths of the emitting heat sources.
+    H2 : float or array
+        Lengths of the receiving heat sources.
+    D2 : float or array
+        Buried depths of the receiving heat sources.
+    reaSource : bool
+        True if the real part of the FLS solution is to be included.
+        Default is True.
+    imgSource : bool
+        True if the image part of the FLS solution is to be included.
+        Default is True.
+
+    Returns
+    -------
+    h : array
+        Values of the Laplace-domain transfer function of the FLS solution,
+        shape (..., nP), or (...,) if p is a float. The transfer function is
+        dimensionless and normalized as the thermal response factors, i.e.
+        the Laplace transform of the borehole wall temperature variation is:
+
+        .. math::
+            \\Delta \\hat{T}_{b,2}(p) =
+            \\frac{1}{2 \\pi k_s H_2} (p \\hat{h}(p)) \\hat{Q}_1(p)
+
+    """
+    scalar_p = _time_is_scalar(p)
+    p = np.atleast_1d(np.asarray(p, dtype=float))
+    # Integrand of the finite line source solution
+    f = _finite_line_source_node_integrand(
+        dis, H1, D1, H2, D2, reaSource, imgSource)
+    d_min = float(np.min(dis)) if np.size(dis) > 0 else 1.
+    h = np.stack(
+        [_finite_line_source_laplace_integral(f, p_m, alpha, d_min)
+         if p_m > 0.
+         else 2. * H2 * _finite_line_source_steady_state(
+             dis, H1, D1, H2, D2, reaSource, imgSource)
+         for p_m in p],
+        axis=-1)
+    if scalar_p:
+        h = 0.5 / H2 * h[..., 0]
+    else:
+        h = 0.5 / np.expand_dims(np.asarray(H2, dtype=float), axis=-1) * h
+    return h
+
+
+def _finite_line_source_laplace_integral(
+        f, p, alpha, d_min, deg=10, log_ratio=0.5):
+    """
+    Evaluate the integral of the finite line source integrand weighted by
+    the Laplace-domain kernel:
+
+        I(p) = int_0^inf f(s) * exp(-p / (4 * alpha * s**2)) ds
+
+    using composite Gauss-Legendre quadrature over log-spaced panels. The
+    integral is truncated at s_max = 9 / d_min (where the integrand is
+    negligible) and below s_lo (where the weighting factor is below
+    ~1e-15). Panels are refined near s_lo, where the weighting factor
+    varies rapidly.
+
+    Parameters
+    ----------
+    f : callable
+        Integrand of the finite line source solution. Accepts an array of
+        integration points s of shape (ns,) and returns an array of shape
+        (..., ns).
+    p : float
+        Laplace parameter (in 1/seconds). Must be positive.
+    alpha : float
+        Soil thermal diffusivity (in m2/s).
+    d_min : float
+        Minimum radial distance (in meters) in the integrand.
+    deg : int, optional
+        Degree of the Gauss-Legendre quadrature over each panel.
+        Default is 10.
+    log_ratio : float, optional
+        Maximum width of a panel in logarithmic space.
+        Default is 0.5.
+
+    Returns
+    -------
+    I : array
+        Values of the integral, shape (...,).
+
+    """
+    # Shape of the integrand
+    out_shape = np.shape(f(np.ones(1)))[:-1]
+    out_size = int(np.prod(out_shape, dtype=int))
+    # Cutoff of the weighting factor exp(-E) at E_cut (exp(-34.5) ~ 1e-15)
+    E_cut = 34.5
+    s_max = 9.0 / d_min
+    s_lo = np.sqrt(p / (4. * alpha * E_cut))
+    if out_size == 0 or s_lo >= s_max:
+        return np.zeros(out_shape)
+    # Log-spaced panel edges, refined where the weighting factor varies
+    # rapidly : the local logarithmic derivative of the weighting factor is
+    # 2 * E(s), with E(s) = p / (4 * alpha * s**2). Panel widths are
+    # limited to 4 / E so that the Gauss-Legendre rule resolves the
+    # variation of the weighting factor.
+    x_lo = np.log(s_lo)
+    x_hi = np.log(s_max)
+    edges = [x_lo]
+    while edges[-1] < x_hi:
+        E = p / (4. * alpha * np.exp(2. * edges[-1]))
+        width = min(log_ratio, 4. / max(E, 1e-12))
+        edges.append(min(edges[-1] + width, x_hi))
+    s_edges = np.exp(np.asarray(edges))
+    panel_lo = s_edges[:-1]
+    panel_hi = s_edges[1:]
+    nPanels = len(panel_lo)
+    # Gauss-Legendre nodes and weights on each panel
+    x, w = _roots_legendre_cached(deg)
+    panel_mid = 0.5 * (panel_lo + panel_hi)
+    panel_half = 0.5 * (panel_hi - panel_lo)
+    s_nodes = (panel_mid[:, np.newaxis]
+               + panel_half[:, np.newaxis] * x).flatten()
+    w_nodes = (panel_half[:, np.newaxis] * w).flatten()
+    # Weighted integral, evaluated in chunks to limit memory use
+    weights = w_nodes * np.exp(-p / (4. * alpha * np.square(s_nodes)))
+    I = np.zeros(out_shape)
+    chunk_size = max(2**23 // max(deg * out_size, 1), 1) * deg
+    for i0 in range(0, nPanels * deg, chunk_size):
+        i1 = min(i0 + chunk_size, nPanels * deg)
+        I += f(s_nodes[i0:i1]) @ weights[i0:i1]
+    return I
+
+
 def _finite_line_source_node_integrand(dis, H1, D1, H2, D2, reaSource, imgSource):
     """
     Integrand of the finite line source solution, evaluated at an array of

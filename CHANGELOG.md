@@ -2,6 +2,29 @@
 
 ## Version 2.4 (in development)
 
+### New features
+
+* Introduced a new `'laplace'` g-function calculation method. The
+  g-function is evaluated in the Laplace domain, where the temporal
+  superposition of the finite line source solution reduces to an algebraic
+  product : each sampled value of the Laplace parameter gives an
+  independent, history-free system of equations (the transfer function of
+  the FLS solution is obtained from the same integrand as the time-domain
+  solution, with the sharp time cutoff replaced by a smooth exponential
+  weight). The g-function is reconstructed as a sum of decaying
+  exponentials `g(t) = g_inf - sum_m w_m * exp(-lambda_m * t)` -- a
+  representation justified by the complete monotonicity of the time
+  derivative of the g-function -- by regularized least squares on the
+  Laplace-domain samples, with the steady-state g-function evaluated in
+  closed form. In contrast with the time-marching methods, the method
+  evaluates the exact continuous-time g-function (the time-marching
+  solutions converge to it under time-grid refinement), the number of
+  systems of equations is independent of the number of time values, and
+  the exponential-sum representation evaluates the g-function at any time.
+  The method supports the `'UHTR'` and `'UBWT'` boundary conditions for
+  vertical bore fields, and reuses the similarity identification and the
+  matrix-free (factored) solution path of the `'similarities'` method.
+
 ### Other changes
 
 * Drastically improved the performance of g-function calculations:
