@@ -220,19 +220,38 @@ class Similarities(_BaseSolver):
             # of thermal response factors would exhaust memory. For small
             # bore fields (or highly irregular bore fields with many unique
             # distances), the dense solver is faster.
-            nb = len(self.boreholes)
-            nSeg = self.nBoreSegments[0]
-            nDis = len(self.borehole_to_borehole_distances_vertical[0])
-            nt = len(np.atleast_1d(time))
-            matvec_operations = nb**2 * nSeg + nDis * nSeg**2 * nb
-            dense_storage_bytes = 8 * self.nSources**2 * (nt + 2)
-            if ((self.nSources >= self._factored_solver_min_nSources
-                 and self._factored_solver_operations_ratio
-                     * matvec_operations < self.nSources**3)
-                    or (dense_storage_bytes
-                        > self._factored_solver_max_dense_storage)):
+            if self._use_factored_solver(len(np.atleast_1d(time))):
                 return self._solve_factored_UBWT(time, alpha)
         return super().solve(time, alpha)
+
+    def _use_factored_solver(self, nStack):
+        """
+        Return True if the factored (matrix-free) solver is expected to be
+        cheaper than the dense solver, or if the dense matrix of thermal
+        response factors would exhaust memory.
+
+        Parameters
+        ----------
+        nStack : int
+            Number of stacked matrices of thermal response factors (i.e.
+            the number of time values, or of Laplace-domain sample nodes).
+
+        Returns
+        -------
+        use_factored : bool
+            True if the factored solver should be used.
+
+        """
+        nb = len(self.boreholes)
+        nSeg = self.nBoreSegments[0]
+        nDis = len(self.borehole_to_borehole_distances_vertical[0])
+        matvec_operations = nb**2 * nSeg + nDis * nSeg**2 * nb
+        dense_storage_bytes = 8 * self.nSources**2 * (nStack + 2)
+        return ((self.nSources >= self._factored_solver_min_nSources
+                 and self._factored_solver_operations_ratio
+                     * matvec_operations < self.nSources**3)
+                or (dense_storage_bytes
+                    > self._factored_solver_max_dense_storage))
 
     def _fls_kernel(self, time, alpha, dis, H1, D1, H2, D2):
         """
@@ -635,21 +654,34 @@ class Similarities(_BaseSolver):
             return Z + Z_coarse[:, np.newaxis, :]
 
         # Solve the two systems of equations of the Schur complement
-        # simultaneously
-        B = np.stack(
-            (H_b.reshape(nb, nSeg),
-             (H_b * T_b0).reshape(nb, nSeg)),
-            axis=-1)
-        if X_1_previous is None:
-            X0 = None
+        # simultaneously. When there is no load history (T_b0 = 0), the
+        # second system has a trivial solution and only the first system
+        # is solved.
+        zero_load_history = not np.any(T_b0)
+        if zero_load_history:
+            B = H_b.reshape(nb, nSeg, 1)
+            if X_1_previous is None:
+                X0 = None
+            else:
+                X0 = X_1_previous.reshape(nb, nSeg, 1)
         else:
-            X0 = np.stack(
-                (X_1_previous.reshape(nb, nSeg),
-                 X_2_previous.reshape(nb, nSeg)),
+            B = np.stack(
+                (H_b.reshape(nb, nSeg),
+                 (H_b * T_b0).reshape(nb, nSeg)),
                 axis=-1)
+            if X_1_previous is None:
+                X0 = None
+            else:
+                X0 = np.stack(
+                    (X_1_previous.reshape(nb, nSeg),
+                     X_2_previous.reshape(nb, nSeg)),
+                    axis=-1)
         X, _ = _pcg(matvec, precond, B, x0=X0)
         X_1 = X[:, :, 0].flatten()
-        X_2 = X[:, :, 1].flatten()
+        if zero_load_history:
+            X_2 = np.zeros_like(X_1)
+        else:
+            X_2 = X[:, :, 1].flatten()
         T_b = (H_tot + H_b @ X_2) / (H_b @ X_1)
         Q_b = T_b * X_1 - X_2
         return Q_b, T_b, X_1, X_2

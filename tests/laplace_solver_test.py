@@ -131,23 +131,48 @@ def test_gfunction_laplace_UBWT(small_field):
 # =============================================================================
 # The factored path of the 'laplace' solver returns the same g-function as
 # its dense path
-def test_gfunction_laplace_factored(small_field):
+@pytest.mark.parametrize("boundary_condition", ['UBWT', 'UHTR'])
+def test_gfunction_laplace_factored(small_field, boundary_condition):
     alpha = 1e-6
     ts = 150.**2 / (9. * alpha)
     time = np.exp(np.linspace(-8.5, 3.4, 12)) * ts
     solver_dense = gt.solvers.Laplace(
-        small_field, None, time, 'UBWT', nSegments=8)
+        small_field, None, time, boundary_condition, nSegments=8)
     gFunc_dense = solver_dense.solve(time, alpha)
 
     # Force the factored path by lowering the size thresholds
     class LaplaceFactored(gt.solvers.Laplace):
         _factored_solver_min_nSources = 1
+        _factored_solver_operations_ratio = 0
 
     solver_factored = LaplaceFactored(
-        small_field, None, time, 'UBWT', nSegments=8)
+        small_field, None, time, boundary_condition, nSegments=8)
     assert solver_factored._identical_vertical_field
+    assert solver_factored._use_factored_solver(len(time))
     gFunc_factored = solver_factored.solve(time, alpha)
     assert np.allclose(gFunc_factored, gFunc_dense, rtol=1e-6)
+
+
+# Time values of zero (and below) evaluate to a zero g-function and
+# infinite time values evaluate to the steady-state g-function
+def test_gfunction_laplace_time_edge_cases(small_field):
+    from pygfunction.heat_transfer import _finite_line_source_steady_state
+    alpha = 1e-6
+    ts = 150.**2 / (9. * alpha)
+    time = np.array([0., 0.1 * ts, 10. * ts, np.inf])
+    gFunc = gt.gfunction.gFunction(
+        small_field, alpha, time=time, method='laplace',
+        boundary_condition='UBWT', options={'nSegments': 8}).gFunc
+    # Zero g-function at t = 0
+    assert gFunc[0] == 0.
+    # The g-function is increasing and bounded by the steady-state value
+    assert np.all(np.diff(gFunc) > 0.)
+    # Interior values agree with the same solver on a regular time vector
+    gFunc_regular = gt.gfunction.gFunction(
+        small_field, alpha, time=np.array([0.1 * ts, 10. * ts]),
+        method='laplace', boundary_condition='UBWT',
+        options={'nSegments': 8}).gFunc
+    assert np.allclose(gFunc[1:3], gFunc_regular, rtol=1e-6)
 
 
 # =============================================================================

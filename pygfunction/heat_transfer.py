@@ -1295,8 +1295,11 @@ def _finite_line_source_laplace(
     f = _finite_line_source_node_integrand(
         dis, H1, D1, H2, D2, reaSource, imgSource)
     d_min = float(np.min(dis)) if np.size(dis) > 0 else 1.
+    # Shape of the integrand (evaluated once for all Laplace nodes)
+    out_shape = np.shape(f(np.ones(1)))[:-1]
     h = np.stack(
-        [_finite_line_source_laplace_integral(f, p_m, alpha, d_min)
+        [_finite_line_source_laplace_integral(
+             f, p_m, alpha, d_min, out_shape)
          if p_m > 0.
          else 2. * H2 * _finite_line_source_steady_state(
              dis, H1, D1, H2, D2, reaSource, imgSource)
@@ -1310,7 +1313,7 @@ def _finite_line_source_laplace(
 
 
 def _finite_line_source_laplace_integral(
-        f, p, alpha, d_min, deg=10, log_ratio=0.5):
+        f, p, alpha, d_min, out_shape, deg=10, log_ratio=0.5):
     """
     Evaluate the integral of the finite line source integrand weighted by
     the Laplace-domain kernel:
@@ -1335,6 +1338,8 @@ def _finite_line_source_laplace_integral(
         Soil thermal diffusivity (in m2/s).
     d_min : float
         Minimum radial distance (in meters) in the integrand.
+    out_shape : tuple
+        Shape of the integrand (excluding the integration points axis).
     deg : int, optional
         Degree of the Gauss-Legendre quadrature over each panel.
         Default is 10.
@@ -1348,8 +1353,6 @@ def _finite_line_source_laplace_integral(
         Values of the integral, shape (...,).
 
     """
-    # Shape of the integrand
-    out_shape = np.shape(f(np.ones(1)))[:-1]
     out_size = int(np.prod(out_shape, dtype=int))
     # Cutoff of the weighting factor exp(-E) at E_cut (exp(-34.5) ~ 1e-15)
     E_cut = 34.5

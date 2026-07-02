@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import warnings
 from time import perf_counter
 
 import numpy as np
@@ -29,7 +30,13 @@ class Laplace(Similarities):
     the g-function is the step response of a passive, reciprocal
     (self-adjoint) diffusion system, so that its time derivative is
     completely monotone (Bernstein's theorem). The weights are identified
-    by non-negative least squares on the Laplace-domain samples.
+    by regularized least squares on the Laplace-domain samples, with a
+    non-negative fit (which guarantees a monotone and bounded
+    reconstruction) as a fallback.
+
+    No linearization is applied at small time values : the g-function is
+    evaluated exactly at all requested times (it is zero at t <= 0 and
+    equal to the steady-state g-function at t = inf).
 
     In contrast with the time-marching solvers, the solution at each
     Laplace node is independent (no load history reconstruction and no
@@ -130,8 +137,19 @@ class Laplace(Similarities):
         # Number of time values
         self.time = time
         t = np.atleast_1d(np.asarray(self.time, dtype=float))
-        t_min = np.min(t)
-        t_max = np.max(t)
+        # Time values of zero (or below) evaluate to a zero g-function and
+        # infinite time values evaluate to the steady-state g-function :
+        # only positive finite time values set the range of the Laplace
+        # nodes
+        t_positive = t[(t > 0.) & np.isfinite(t)]
+        if len(t_positive) > 0:
+            t_min = np.min(t_positive)
+            t_max = np.max(t_positive)
+        else:
+            # Degenerate time vector : only the steady-state solution and
+            # the zero solution are required. A dummy range is used.
+            t_min = 1.
+            t_max = 1.
         # Laplace-domain sample nodes (log-spaced, with the steady-state
         # solution at p = 0 as the first node)
         p_min = self._p_min_factor / t_max
@@ -157,6 +175,10 @@ class Laplace(Similarities):
             p_nodes[1:], G[1:], g_infinity, t_min, t_max)
         decay = np.exp(-np.multiply.outer(t, lambdas))
         gFunc = g_infinity - decay @ w
+        # The g-function is zero at (and below) time t=0. Infinite time
+        # values are correctly evaluated by the exponential sum (the decay
+        # factors vanish).
+        gFunc[t <= 0.] = 0.
 
         # Store temperature and heat extraction rate profiles
         if self.profiles:
@@ -165,9 +187,11 @@ class Laplace(Similarities):
             if self.boundary_condition == 'UHTR':
                 # For 'UHTR', the transfer functions hold the borehole
                 # wall temperatures under uniform heat extraction rates
+                profiles[:, t <= 0.] = 0.
                 self.Q_b = 1
                 self.T_b = profiles
             else:
+                profiles[:, t <= 0.] = 1.
                 self.Q_b = profiles
                 self.T_b = gFunc
         toc = perf_counter()
@@ -216,18 +240,9 @@ class Laplace(Similarities):
         # The factored (matrix-free) path is used under the same conditions
         # as the time-domain solver
         nb = len(self.boreholes)
-        use_factored = False
-        if self._identical_vertical_field and nb > 1:
-            nSeg = self.nBoreSegments[0]
-            nDis = len(self.borehole_to_borehole_distances_vertical[0])
-            matvec_operations = nb**2 * nSeg + nDis * nSeg**2 * nb
-            dense_storage_bytes = 8 * self.nSources**2 * (nP + 2)
-            use_factored = (
-                (self.nSources >= self._factored_solver_min_nSources
-                 and self._factored_solver_operations_ratio
-                     * matvec_operations < self.nSources**3)
-                or (dense_storage_bytes
-                    > self._factored_solver_max_dense_storage))
+        use_factored = (
+            self._identical_vertical_field and nb > 1
+            and self._use_factored_solver(nP))
         if use_factored:
             if self.disp:
                 print('Calculating Laplace-domain response factors ...',
@@ -301,10 +316,12 @@ class Laplace(Similarities):
 
             g_infinity - G(p) = sum_m w_m * p / (p + lambda_m)
 
-        The weights w_m >= 0 are identified by non-negative least squares
-        over a log-spaced grid of candidate decay rates lambda_m. The
-        non-negativity of the weights follows from the complete
-        monotonicity of the time derivative of the g-function.
+        The weights are identified by (truncated-SVD-regularized) least
+        squares over a log-spaced grid of candidate decay rates lambda_m.
+        The reconstruction is verified to be monotone and bounded ;
+        otherwise, a non-negative fit (justified by the complete
+        monotonicity of the time derivative of the g-function, and
+        guaranteeing admissibility) is used as a fallback.
 
         Parameters
         ----------
@@ -345,20 +362,36 @@ class Laplace(Similarities):
         # to be physically admissible (non-decreasing and bounded by the
         # steady-state value) ; otherwise, a non-negative fit (which
         # guarantees admissibility) is used instead.
-        A = p[:, np.newaxis] / (p[:, np.newaxis] + lambdas)
+        A = _exponential_sum_design_matrix(p, lambdas)
         y = g_infinity - G
+
+        def is_admissible(w):
+            t_check = np.logspace(np.log10(t_min), np.log10(t_max), 200)
+            g_check = g_infinity \
+                - np.exp(-np.multiply.outer(t_check, lambdas)) @ w
+            tolerance = 1e-6 * max(abs(g_infinity), 1.)
+            return (np.all(np.diff(g_check) >= -tolerance)
+                    and np.all(g_check >= -tolerance)
+                    and np.all(g_check <= g_infinity + tolerance))
+
         w, *_ = np.linalg.lstsq(A, y, rcond=None)
-        t_check = np.logspace(np.log10(t_min), np.log10(t_max), 200)
-        g_check = g_infinity \
-            - np.exp(-np.multiply.outer(t_check, lambdas)) @ w
-        tolerance = 1e-6 * max(abs(g_infinity), 1.)
-        if not (np.all(np.diff(g_check) >= -tolerance)
-                and np.all(g_check >= -tolerance)
-                and np.all(g_check <= g_infinity + tolerance)):
+        if not is_admissible(w):
+            # Fall back to a non-negative fit, which guarantees a monotone
+            # and bounded reconstruction
+            warnings.warn(
+                'The exponential-sum reconstruction of the g-function was '
+                'not monotone and bounded : a non-negative fit is used '
+                'instead. The g-function accuracy may be reduced.',
+                RuntimeWarning)
             result = lsq_linear(
                 A, y, bounds=(0., np.inf), method='bvls', tol=1e-14,
                 max_iter=10*len(lambdas))
             w = result.x
+            if not result.success:
+                warnings.warn(
+                    'The non-negative exponential-sum fit did not '
+                    'converge. The g-function accuracy may be reduced.',
+                    RuntimeWarning)
         return lambdas, w
 
     def _fit_profiles(self, p, Q_transfer, lambdas):
@@ -385,7 +418,7 @@ class Laplace(Similarities):
             (nSources, nModes).
 
         """
-        A = p[:, np.newaxis] / (p[:, np.newaxis] + lambdas)
+        A = _exponential_sum_design_matrix(p, lambdas)
         y = Q_transfer[:, 0:1] - Q_transfer[:, 1:]
         c, *_ = np.linalg.lstsq(A, y.T, rcond=None)
         return c.T
@@ -410,7 +443,10 @@ class Laplace(Similarities):
         super()._check_solver_specific_inputs()
         assert self.boundary_condition in ('UHTR', 'UBWT'), \
             "The 'laplace' solver only supports the 'UHTR' and 'UBWT' " \
-            "boundary conditions."
+            "boundary conditions. Note that the boundary condition " \
+            "defaults to 'MIFT' when a network is provided : provide " \
+            "boundary_condition='UBWT' (or 'UHTR') explicitly to use " \
+            "the 'laplace' solver."
         assert not np.any([b.is_tilted() for b in self.boreholes]), \
             "The 'laplace' solver only supports vertical boreholes."
         assert type(self.nodes_per_decade) is int \
@@ -422,3 +458,28 @@ class Laplace(Similarities):
             "The option 'modes_per_decade' should be an int greater or " \
             "equal to 2."
         return
+
+
+def _exponential_sum_design_matrix(p, lambdas):
+    """
+    Design matrix of the exponential-sum collocation problem.
+
+    The Laplace transform of a sum of decaying exponentials gives, for the
+    transfer function samples:
+
+        y(p) = sum_m w_m * p / (p + lambda_m)
+
+    Parameters
+    ----------
+    p : array
+        Values of the Laplace parameter (in 1/seconds), shape (nP,).
+    lambdas : array
+        Candidate decay rates (in 1/seconds), shape (nModes,).
+
+    Returns
+    -------
+    A : array
+        Design matrix, shape (nP, nModes).
+
+    """
+    return p[:, np.newaxis] / (p[:, np.newaxis] + lambdas)
