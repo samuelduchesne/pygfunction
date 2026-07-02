@@ -135,7 +135,10 @@ class _BaseSolver:
         elif segment_ratios is None:
             segment_ratios = [np.full(n, 1./n) for n in self.nBoreSegments]
         elif callable(segment_ratios):
-            segment_ratios = [segment_ratios(n) for n in self.nBoreSegments]
+            # Evaluate the segment ratios once per unique number of segments
+            unique_ratios = {
+                n: segment_ratios(n) for n in set(self.nBoreSegments)}
+            segment_ratios = [unique_ratios[n] for n in self.nBoreSegments]
         self.segment_ratios = segment_ratios
         # Shortcut for segment_ratios comparisons
         self._equal_segment_ratios = \
@@ -238,6 +241,10 @@ class _BaseSolver:
         nt_long = len(time_long)
         # Calculate segment to segment thermal response factors
         h_ij = self.thermal_response_factors(time_long, alpha, kind=self.kind)
+        # Transposed contiguous copy of the thermal response factors, used
+        # for fast interpolation and temporal superposition. The first index
+        # corresponds to time (with time t=0 at index 0).
+        h_ij_T = np.ascontiguousarray(np.moveaxis(h_ij.y, -1, 0))
         # Segment lengths
         H_b = self.segment_lengths()
         if self.boundary_condition == 'MIFT':
@@ -263,7 +270,7 @@ class _BaseSolver:
                 # boreholes
 
                 # Thermal response factors evaluated at time t[p]
-                h_dt = h_ij.y[:,:,p+1]
+                h_dt = h_ij_T[p+1]
                 # Borehole wall temperatures are calculated by the sum of
                 # contributions of all segments
                 T_b[:,p+p0] = np.sum(h_dt, axis=1)
@@ -283,6 +290,30 @@ class _BaseSolver:
             Q_b = np.zeros((self.nSources, nt), dtype=self.dtype)
             T_b = np.zeros(nt, dtype=self.dtype)
 
+            # Evaluate the g-function with uniform borehole wall
+            # temperature
+            # ---------------------------------------------------------
+            # Build a system of equation [A]*[X] = [B] for the
+            # evaluation of the g-function. [A] is a coefficient
+            # matrix, [X] = [Q_b,T_b] is a state space vector of the
+            # borehole heat extraction rates and borehole wall
+            # temperature (equal for all segments), [B] is a
+            # coefficient vector.
+            #
+            # Spatial superposition: [T_b] = [T_b0] + [h_ij_dt]*[Q_b]
+            # Energy conservation: sum([Q_b*Hb]) = sum([Hb])
+            # ---------------------------------------------------------
+            # Initialize coefficient matrix and vector. The (constant)
+            # coefficients are set once and the thermal response factors
+            # are updated at each time step.
+            A = np.empty(
+                (self.nSources + 1, self.nSources + 1), dtype=self.dtype)
+            A[:-1, -1] = -1.
+            A[-1, :-1] = H_b
+            A[-1, -1] = 0.
+            B = np.empty(self.nSources + 1, dtype=self.dtype)
+            B[-1] = H_tot
+
             # Build and solve the system of equations at all times
             p0 = max(0, p_long-1)
             for p in range(nt_long):
@@ -292,32 +323,18 @@ class _BaseSolver:
                 else:
                     dt = time_long[p]
                 # Thermal response factors evaluated at t=dt
-                h_dt = h_ij(dt)
+                h_dt = self._interpolate_thermal_response_factors(
+                    h_ij, h_ij_T, dt)
                 # Reconstructed load history
                 Q_reconstructed = self.load_history_reconstruction(
                     time_long[0:p+1], Q_b[:,p0:p+p0+1])
                 # Borehole wall temperature for zero heat extraction at
                 # current step
-                T_b0 = self.temporal_superposition(
-                    h_ij.y[:,:,1:], Q_reconstructed)
+                T_b0 = self._temporal_superposition_transposed(
+                    h_ij_T, Q_reconstructed)
 
-                # Evaluate the g-function with uniform borehole wall
-                # temperature
-                # ---------------------------------------------------------
-                # Build a system of equation [A]*[X] = [B] for the
-                # evaluation of the g-function. [A] is a coefficient
-                # matrix, [X] = [Q_b,T_b] is a state space vector of the
-                # borehole heat extraction rates and borehole wall
-                # temperature (equal for all segments), [B] is a
-                # coefficient vector.
-                #
-                # Spatial superposition: [T_b] = [T_b0] + [h_ij_dt]*[Q_b]
-                # Energy conservation: sum([Q_b*Hb]) = sum([Hb])
-                # ---------------------------------------------------------
-                A = np.block([[h_dt, -np.ones((self.nSources, 1),
-                                              dtype=self.dtype)],
-                              [H_b, 0.]])
-                B = np.hstack((-T_b0, H_tot))
+                A[:-1, :-1] = h_dt
+                B[:-1] = -T_b0
                 # Solve the system of equations
                 X = np.linalg.solve(A, B)
                 # Store calculated heat extraction rates
@@ -357,6 +374,37 @@ class _BaseSolver:
                         self.nBoreSegments,
                         segment_ratios=self.segment_ratios)
                 k_s = self.network.p[0].k_s
+
+                # Evaluate the g-function with mixed inlet fluid
+                # temperatures
+                # ---------------------------------------------------------
+                # Build a system of equation [A]*[X] = [B] for the
+                # evaluation of the g-function. [A] is a coefficient
+                # matrix, [X] = [Q_b,T_b,Tf_in] is a state space vector of
+                # the borehole heat extraction rates, borehole wall
+                # temperatures and inlet fluid temperature (into the bore
+                # field), [B] is a coefficient vector.
+                #
+                # Spatial superposition: [T_b] = [T_b0] + [h_ij_dt]*[Q_b]
+                # Heat transfer inside boreholes:
+                # [Q_{b,i}] = [a_in]*[T_{f,in}] + [a_{b,i}]*[T_{b,i}]
+                # Energy conservation: sum([Q_b*H_b]) = sum([H_b])
+                # ---------------------------------------------------------
+                # Initialize coefficient matrix and vector. The (constant)
+                # coefficients are set once and the thermal response
+                # factors are updated at each time step.
+                nS = self.nSources
+                i_diag = np.arange(nS)
+                A = np.zeros((2*nS + 1, 2*nS + 1), dtype=self.dtype)
+                A[i_diag, nS + i_diag] = -1.
+                A[nS + i_diag, i_diag] = 1.
+                A[nS:2*nS, nS:2*nS] = \
+                    a_b_j/(2.0*np.pi*k_s*np.atleast_2d(Hb_individual).T)
+                A[nS:2*nS, -1:] = \
+                    a_in_j/(2.0*np.pi*k_s*np.atleast_2d(Hb_individual).T)
+                A[-1, :nS] = H_b
+                B = np.zeros(2*nS + 1, dtype=self.dtype)
+                B[-1] = H_tot
                 for p in range(nt_long):
                     # Current thermal response factor matrix
                     if p > 0:
@@ -364,42 +412,18 @@ class _BaseSolver:
                     else:
                         dt = time_long[p]
                     # Thermal response factors evaluated at t=dt
-                    h_dt = h_ij(dt)
+                    h_dt = self._interpolate_thermal_response_factors(
+                        h_ij, h_ij_T, dt)
                     # Reconstructed load history
                     Q_reconstructed = self.load_history_reconstruction(
                         time_long[0:p+1], Q_b[j,:,p0:p+p0+1])
                     # Borehole wall temperature for zero heat extraction at
                     # current step
-                    T_b0 = self.temporal_superposition(
-                        h_ij.y[:,:,1:], Q_reconstructed)
+                    T_b0 = self._temporal_superposition_transposed(
+                        h_ij_T, Q_reconstructed)
 
-                    # Evaluate the g-function with mixed inlet fluid
-                    # temperatures
-                    # ---------------------------------------------------------
-                    # Build a system of equation [A]*[X] = [B] for the
-                    # evaluation of the g-function. [A] is a coefficient
-                    # matrix, [X] = [Q_b,T_b,Tf_in] is a state space vector of
-                    # the borehole heat extraction rates, borehole wall
-                    # temperatures and inlet fluid temperature (into the bore
-                    # field), [B] is a coefficient vector.
-                    #
-                    # Spatial superposition: [T_b] = [T_b0] + [h_ij_dt]*[Q_b]
-                    # Heat transfer inside boreholes:
-                    # [Q_{b,i}] = [a_in]*[T_{f,in}] + [a_{b,i}]*[T_{b,i}]
-                    # Energy conservation: sum([Q_b*H_b]) = sum([H_b])
-                    # ---------------------------------------------------------
-                    A = np.block(
-                        [[h_dt,
-                          -np.eye(self.nSources, dtype=self.dtype),
-                          np.zeros((self.nSources, 1), dtype=self.dtype)],
-                         [np.eye(self.nSources, dtype=self.dtype),
-                          a_b_j/(2.0*np.pi*k_s*np.atleast_2d(Hb_individual).T),
-                          a_in_j/(2.0*np.pi*k_s*np.atleast_2d(Hb_individual).T)],
-                         [H_b, np.zeros(self.nSources + 1, dtype=self.dtype)]])
-                    B = np.hstack(
-                        (-T_b0,
-                         np.zeros(self.nSources, dtype=self.dtype),
-                         H_tot))
+                    A[:nS, :nS] = h_dt
+                    B[:nS] = -T_b0
                     # Solve the system of equations
                     X = np.linalg.solve(A, B)
                     # Store calculated heat extraction rates
@@ -496,6 +520,76 @@ class _BaseSolver:
             boreSegments.extend(segments)
 
         return boreSegments
+
+    def _interpolate_thermal_response_factors(self, h_ij, h_ij_T, dt):
+        """
+        Interpolate the segment-to-segment thermal response factors at a
+        time dt.
+
+        For linear interpolation, the interpolation is evaluated directly
+        from the transposed array of thermal response factors. This is
+        faster than the generic scipy.interpolate.interp1d evaluation since
+        the interpolated planes are contiguous in memory.
+
+        Parameters
+        ----------
+        h_ij : interp1d
+            interp1d object (scipy.interpolate) of the matrix of
+            segment-to-segment thermal response factors.
+        h_ij_T : array
+            Transposed contiguous array of segment-to-segment thermal
+            response factors (time on the first axis, with time t=0 at
+            index 0).
+        dt : float
+            Time (in seconds) at which the thermal response factors are
+            interpolated.
+
+        Returns
+        -------
+        h_dt : array
+            Matrix of segment-to-segment thermal response factors at
+            time dt.
+
+        """
+        if self.kind == 'linear':
+            x = h_ij.x
+            j = min(max(int(np.searchsorted(x, dt)), 1), len(x) - 1)
+            w = (dt - x[j-1]) / (x[j] - x[j-1])
+            return h_ij_T[j-1] + w * (h_ij_T[j] - h_ij_T[j-1])
+        return h_ij(dt)
+
+    def _temporal_superposition_transposed(self, h_ij_T, Q_reconstructed):
+        """
+        Temporal superposition for inequal time steps, evaluated from the
+        transposed array of thermal response factors.
+
+        Parameters
+        ----------
+        h_ij_T : array
+            Transposed contiguous array of segment-to-segment thermal
+            response factors (time on the first axis, with time t=0 at
+            index 0).
+        Q_reconstructed : array
+            Reconstructed heat extraction rates of all segments at all
+            times.
+
+        Returns
+        -------
+        T_b0 : array
+            Current values of borehole wall temperatures assuming no heat
+            extraction during current time step.
+
+        """
+        # Number of time steps
+        nt = Q_reconstructed.shape[1]
+        # Time-reversed heat extraction rate increments
+        dQ = np.concatenate(
+            (Q_reconstructed[:,0:1],
+             Q_reconstructed[:,1:] - Q_reconstructed[:,0:-1]), axis=1)[:,::-1]
+        # Borehole wall temperature
+        T_b0 = (h_ij_T[1:nt+1] @ dQ.T[:,:,np.newaxis]).sum(axis=0)[:,0]
+
+        return T_b0
 
     def temporal_superposition(self, h_ij, Q_reconstructed):
         """

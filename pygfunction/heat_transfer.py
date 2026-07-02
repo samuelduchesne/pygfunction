@@ -1246,15 +1246,103 @@ def _finite_line_source_node_integrand(dis, H1, D1, H2, D2, reaSource, imgSource
     """
     p, q = _finite_line_source_coefficients(
         H1, D1, H2, D2, reaSource, imgSource)
-    dd = np.square(dis)
+    G = _erfint_linear_combination(p, q)
+    E = _exp_outer_deduplicated(np.square(dis))
 
     def f(s):
-        G = np.einsum(
-            'i,...ik->...k', p, erfint(np.multiply.outer(q, s)))
-        E = np.exp(-np.multiply.outer(dd, np.square(s)))
-        return E * G / np.square(s)
+        return E(s) * G(s) / np.square(s)
 
     return f
+
+
+def _erfint_linear_combination(p, q):
+    """
+    Efficient evaluation of the linear combination of integrals of the
+    error function in the integrand of the finite line source solution.
+
+    The returned callable evaluates:
+
+        G(s) = sum_i (p_i * erfint(q_i * s))
+
+    at an array of integration points s. Since erfint is an even function,
+    the (typically few) unique absolute values of the coefficients q are
+    identified so that erfint is only evaluated once per unique value. The
+    linear combination is then applied through a sparse matrix-matrix
+    product.
+
+    Parameters
+    ----------
+    p : array
+        Signs of the terms of the integrand, shape (nq,).
+    q : array
+        Coefficients of the terms of the integrand. The last axis is of
+        length nq.
+
+    Returns
+    -------
+    G : callable
+        Accepts an array of integration points s of shape (ns,) and returns
+        an array of shape q.shape[:-1] + (ns,).
+
+    """
+    from scipy.sparse import csr_matrix
+    out_shape = q.shape[:-1]
+    nq = q.shape[-1]
+    nElements = int(np.prod(out_shape, dtype=int))
+    # Unique absolute values of the coefficients q (erfint is even)
+    q_unique, inverse = np.unique(np.abs(q).flatten(), return_inverse=True)
+    # Sparse matrix of the linear combination, such that
+    # G = combination @ erfint(outer(q_unique, s))
+    combination = csr_matrix(
+        (np.tile(p, nElements),
+         (np.repeat(np.arange(nElements), nq), inverse)),
+        shape=(nElements, len(q_unique)))
+
+    def G(s):
+        return (combination @ erfint(np.multiply.outer(q_unique, s))).reshape(
+            out_shape + np.shape(s))
+
+    return G
+
+
+def _exp_outer_deduplicated(dd):
+    """
+    Efficient evaluation of the exponential of the outer product of squared
+    distances and squared integration points.
+
+    The returned callable evaluates:
+
+        E(s) = exp(-outer(dd, s**2))
+
+    at an array of integration points s. The exponential is only evaluated
+    once per unique value of dd.
+
+    Parameters
+    ----------
+    dd : float or array
+        Squared radial distances.
+
+    Returns
+    -------
+    E : callable
+        Accepts an array of integration points s of shape (ns,) and returns
+        an array of shape np.shape(dd) + (ns,).
+
+    """
+    dd_shape = np.shape(dd)
+    dd_unique, inverse = np.unique(
+        np.asarray(dd, dtype=float).flatten(), return_inverse=True)
+    if len(dd_unique) == np.prod(dd_shape, dtype=int):
+        # No duplicated distances
+        def E(s):
+            return np.exp(-np.multiply.outer(dd, np.square(s)))
+    else:
+        def E(s):
+            return np.exp(
+                -np.multiply.outer(dd_unique, np.square(s)))[inverse].reshape(
+                    dd_shape + np.shape(s))
+
+    return E
 
 
 def _finite_line_source_equivalent_boreholes_node_integrand(
@@ -1294,14 +1382,13 @@ def _finite_line_source_equivalent_boreholes_node_integrand(
     """
     p, q = _finite_line_source_coefficients(
         H1, D1, H2, D2, reaSource, imgSource)
+    G = _erfint_linear_combination(p, q)
     dd = np.square(np.asarray(dis, dtype=float).flatten())
     wDisT = np.asarray(wDis, dtype=float).T
 
     def f(s):
-        G = np.einsum(
-            'i,...ik->...k', p, erfint(np.multiply.outer(q, s)))
         E = wDisT @ np.exp(-np.multiply.outer(dd, np.square(s)))
-        return np.expand_dims(E, axis=-2) * G / np.square(s)
+        return np.expand_dims(E, axis=-2) * G(s) / np.square(s)
 
     return f
 

@@ -221,22 +221,24 @@ class Similarities(_BaseSolver):
         # Segment-to-segment thermal response factors for same-borehole thermal
         # interactions (vertical boreholes)
         # ---------------------------------------------------------------------
-        # Evaluate FLS at all time steps
-        h, i_segment, j_segment, k_segment = \
-            self._thermal_response_factors_borehole_to_self_vertical(
-                time, alpha)
-        # Broadcast values to h_ij matrix
-        h_ij[j_segment, i_segment, 1:] = h[k_segment, :]
+        if len(self.borehole_to_self_vertical) > 0:
+            # Evaluate FLS at all time steps
+            h, i_segment, j_segment, k_segment = \
+                self._thermal_response_factors_borehole_to_self_vertical(
+                    time, alpha)
+            # Broadcast values to h_ij matrix
+            h_ij[j_segment, i_segment, 1:] = h[k_segment, :]
         # ---------------------------------------------------------------------
         # Segment-to-segment thermal response factors for same-borehole thermal
         # interactions (inclined boreholes)
         # ---------------------------------------------------------------------
-        # Evaluate FLS at all time steps
-        h, i_segment, j_segment, k_segment = \
-            self._thermal_response_factors_borehole_to_self_inclined(
-                time, alpha)
-        # Broadcast values to h_ij matrix
-        h_ij[j_segment, i_segment, 1:] = h[k_segment, :]
+        if len(self.borehole_to_self_inclined) > 0:
+            # Evaluate FLS at all time steps
+            h, i_segment, j_segment, k_segment = \
+                self._thermal_response_factors_borehole_to_self_inclined(
+                    time, alpha)
+            # Broadcast values to h_ij matrix
+            h_ij[j_segment, i_segment, 1:] = h[k_segment, :]
         # ---------------------------------------------------------------------
         # Segment-to-segment thermal response factors for borehole-to-borehole
         # thermal interactions (vertical boreholes)
@@ -276,13 +278,14 @@ class Similarities(_BaseSolver):
         # Segment-to-segment thermal response factors for borehole-to-borehole
         # thermal interactions (inclined boreholes)
         # ---------------------------------------------------------------------
-        # Evaluate FLS at all time steps
-        h, hT, i_segment, j_segment, k_segment = \
-            self._thermal_response_factors_borehole_to_borehole_inclined(
-                time, alpha)
-        # Broadcast values to h_ij matrix
-        h_ij[j_segment, i_segment, 1:] = h[k_segment, :]
-        h_ij[i_segment, j_segment, 1:] = hT[k_segment, :]
+        if len(self.borehole_to_borehole_inclined) > 0:
+            # Evaluate FLS at all time steps
+            h, hT, i_segment, j_segment, k_segment = \
+                self._thermal_response_factors_borehole_to_borehole_inclined(
+                    time, alpha)
+            # Broadcast values to h_ij matrix
+            h_ij[j_segment, i_segment, 1:] = h[k_segment, :]
+            h_ij[i_segment, j_segment, 1:] = hT[k_segment, :]
 
         # Return 2d array if time is a scalar
         if np.isscalar(time):
@@ -291,7 +294,7 @@ class Similarities(_BaseSolver):
         # Interp1d object for thermal response factors
         h_ij = interp1d(
             np.hstack((0., time)), h_ij,
-            kind=kind, copy=True, assume_sorted=True, axis=2)
+            kind=kind, copy=False, assume_sorted=True, axis=2)
         toc = perf_counter()
         if self.disp: print(f' {toc - tic:.3f} sec')
 
@@ -843,6 +846,22 @@ class Similarities(_BaseSolver):
         nBoreholes = len(boreholes)
         borehole_to_self_vertical = []
         borehole_to_self_inclined = []
+        # Fast path : all boreholes are vertical, identical, and share the
+        # same segment discretization. All boreholes then belong to a single
+        # borehole-to-self group and all pairs of boreholes belong to a
+        # single borehole-to-borehole group.
+        if (nBoreholes > 1
+                and self._equal_segment_ratios
+                and all(b.is_vertical() for b in boreholes)
+                and all(self._compare_boreholes(b, boreholes[0])
+                        for b in boreholes[1:])):
+            borehole_to_self_vertical = [list(range(nBoreholes))]
+            borehole_to_borehole_vertical = [
+                [(i, j)
+                 for i in range(nBoreholes)
+                 for j in range(i + 1, nBoreholes)]]
+            return borehole_to_self_vertical, [], \
+                borehole_to_borehole_vertical, []
         # Only check for similarities if there is more than one borehole
         if nBoreholes > 1:
             borehole_to_borehole_vertical = []
@@ -958,6 +977,10 @@ class Similarities(_BaseSolver):
         borehole_to_borehole_distances = [[] for i in range(nGroups)]
         borehole_to_borehole_indices = \
             [np.empty(len(group), dtype=np.uint) for group in borehole_to_borehole]
+        # Positions and radii of the boreholes
+        x = np.array([b.x for b in boreholes])
+        y = np.array([b.y for b in boreholes])
+        r_b = np.array([b.r_b for b in boreholes])
         # Find unique distances for each group
         for i, (pairs, distances, distance_indices) in enumerate(
                 zip(borehole_to_borehole,
@@ -965,9 +988,10 @@ class Similarities(_BaseSolver):
                     borehole_to_borehole_indices)):
             nPairs = len(pairs)
             # Array of all borehole-to-borehole distances within the group
-            all_distances = np.array(
-                [boreholes[pair[0]].distance(boreholes[pair[1]])
-                 for pair in pairs])
+            pairs_array = np.asarray(pairs)
+            i1, j1 = pairs_array[:, 0], pairs_array[:, 1]
+            all_distances = np.maximum(
+                np.hypot(x[i1] - x[j1], y[i1] - y[j1]), r_b[i1])
             # Indices to sort the distance array
             i_sort = all_distances.argsort()
             # Sort the distance array
